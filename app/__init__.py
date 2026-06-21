@@ -1,0 +1,2 @@
+"""QQ message summary app."""
+
