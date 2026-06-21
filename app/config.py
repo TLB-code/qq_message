@@ -31,6 +31,7 @@ class Settings:
     deepseek_model: str
     host: str
     port: int
+    webhook_debug: bool
 
 
 def load_settings() -> Settings:
@@ -42,4 +43,5 @@ def load_settings() -> Settings:
         deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
         host=os.getenv("QQ_SUMMARY_HOST", "127.0.0.1"),
         port=int(os.getenv("QQ_SUMMARY_PORT", "8000")),
+        webhook_debug=os.getenv("QQ_SUMMARY_WEBHOOK_DEBUG", "").lower() in {"1", "true", "yes", "on"},
     )

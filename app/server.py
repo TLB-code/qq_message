@@ -22,6 +22,7 @@ SUMMARIZER = DeepSeekClient(
     model=SETTINGS.deepseek_model,
 )
 STATIC_DIR = BASE_DIR / "app" / "static"
+WEBHOOK_LOG_PATH = SETTINGS.database_path.parent / "webhook_events.log"
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -158,6 +159,8 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _handle_onebot_webhook(self) -> None:
         event = self._read_json(default={})
+        if SETTINGS.webhook_debug:
+            self._log_webhook_event(event)
         message = parse_group_message(event)
         if message is None:
             self._json(HTTPStatus.OK, {"ok": True, "ignored": True})
@@ -176,11 +179,38 @@ class RequestHandler(BaseHTTPRequestHandler):
             },
         )
 
-    def _read_json(self, default: dict | None = None) -> dict:
+    def _read_body(self) -> bytes:
+        transfer_encoding = self.headers.get("Transfer-Encoding", "").lower()
+        if "chunked" in transfer_encoding:
+            chunks: list[bytes] = []
+            while True:
+                line = self.rfile.readline()
+                if not line:
+                    break
+                chunk_size_text = line.split(b";", 1)[0].strip()
+                if not chunk_size_text:
+                    continue
+                chunk_size = int(chunk_size_text, 16)
+                if chunk_size == 0:
+                    while True:
+                        trailer = self.rfile.readline()
+                        if trailer in (b"\r\n", b"\n", b""):
+                            break
+                    break
+                chunks.append(self.rfile.read(chunk_size))
+                self.rfile.read(2)
+            return b"".join(chunks)
+
         length = int(self.headers.get("Content-Length") or "0")
-        if length == 0:
+        if length <= 0:
+            return b""
+        return self.rfile.read(length)
+
+    def _read_json(self, default: dict | None = None) -> dict:
+        body = self._read_body()
+        if not body:
             return default or {}
-        raw = self.rfile.read(length).decode("utf-8")
+        raw = body.decode("utf-8")
         if not raw.strip():
             return default or {}
         try:
@@ -188,6 +218,22 @@ class RequestHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return default or {}
         return data if isinstance(data, dict) else (default or {})
+
+    def _log_webhook_event(self, event: dict) -> None:
+        WEBHOOK_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "received_at": int(time.time()),
+            "post_type": event.get("post_type"),
+            "message_type": event.get("message_type"),
+            "sub_type": event.get("sub_type"),
+            "group_id": event.get("group_id"),
+            "user_id": event.get("user_id"),
+            "message_id": event.get("message_id"),
+            "keys": sorted(event.keys()),
+            "raw": event,
+        }
+        with WEBHOOK_LOG_PATH.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     def _serve_static(self, relative_path: str) -> None:
         safe_path = Path(relative_path).name if "/" not in relative_path else relative_path
@@ -228,4 +274,3 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
-
