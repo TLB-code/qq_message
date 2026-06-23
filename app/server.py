@@ -3,14 +3,21 @@ from __future__ import annotations
 import json
 import mimetypes
 import time
+from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .config import BASE_DIR, load_settings
-from .onebot import group_name_from_event, parse_group_message
-from .storage import Store
+from .onebot import (
+    group_name_from_event,
+    message_display_parts,
+    message_to_summary_text,
+    message_to_text,
+    parse_group_message,
+)
+from .storage import Message, Store
 from .summarizer import DeepSeekClient, SummarizerError
 
 
@@ -23,6 +30,67 @@ SUMMARIZER = DeepSeekClient(
 )
 STATIC_DIR = BASE_DIR / "app" / "static"
 WEBHOOK_LOG_PATH = SETTINGS.database_path.parent / "webhook_events.log"
+DEFAULT_SUMMARY_LIMIT = 500
+MAX_SUMMARY_LIMIT = 500
+DEFAULT_HISTORY_LIMIT = 50
+MAX_HISTORY_LIMIT = 100
+MEDIA_ONLY_SUMMARY = "本批消息只有图片、表情等媒体内容，暂未纳入 AI 总结。"
+
+
+def raw_event_from_record(record: dict) -> dict:
+    try:
+        event = json.loads(record.get("raw_json") or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return event if isinstance(event, dict) else {}
+
+
+def message_from_record(record: dict, content: str | None = None) -> Message:
+    return Message(
+        message_id=str(record["message_id"]),
+        group_id=str(record["group_id"]),
+        user_id=str(record["user_id"]),
+        sender_name=str(record["sender_name"]),
+        content=str(record["content"] if content is None else content),
+        timestamp=int(record["timestamp"]),
+    )
+
+
+def message_payload_from_record(record: dict) -> dict:
+    event = raw_event_from_record(record)
+    payload = message_from_record(record).__dict__
+    payload["display_parts"] = message_display_parts(
+        event.get("raw_message"),
+        event.get("message"),
+        fallback_content=payload["content"],
+        reply_lookup=STORE.get_message,
+    )
+    return payload
+
+
+def summary_message_from_record(record: dict) -> Message | None:
+    event = raw_event_from_record(record)
+    content = message_to_summary_text(
+        event.get("raw_message"),
+        event.get("message"),
+        fallback_content=str(record.get("content") or ""),
+        reply_lookup=STORE.get_message,
+    )
+    if not content:
+        return None
+    return message_from_record(record, content=content)
+
+
+def parse_history_date(value: str) -> tuple[int, int, str]:
+    try:
+        day = date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("Invalid date, expected YYYY-MM-DD") from exc
+
+    local_timezone = datetime.now().astimezone().tzinfo
+    started_at = datetime.combine(day, datetime.min.time(), tzinfo=local_timezone)
+    ended_at = started_at + timedelta(days=1)
+    return int(started_at.timestamp()), int(ended_at.timestamp()), day.isoformat()
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -67,9 +135,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/groups/"):
+            self._handle_group_delete(parsed.path, parse_qs(parsed.query))
+            return
+        self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+
     def _handle_group_get(self, path: str, query: dict[str, list[str]]) -> None:
         parts = path.strip("/").split("/")
-        if len(parts) != 3 or parts[0] != "api" or parts[1] != "groups":
+        if len(parts) not in (3, 4) or parts[0] != "api" or parts[1] != "groups":
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
             return
 
@@ -77,7 +152,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         if group_id.endswith("/"):
             group_id = group_id[:-1]
 
-        if path.endswith("/messages"):
+        if len(parts) == 4:
+            if parts[3] == "history":
+                self._handle_history_get(group_id, query)
+                return
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
             return
 
@@ -91,9 +169,109 @@ class RequestHandler(BaseHTTPRequestHandler):
             HTTPStatus.OK,
             {
                 "group": group,
-                "unread": [message.__dict__ for message in STORE.get_unread_messages(group_id, limit=limit)],
-                "recent": [message.__dict__ for message in STORE.list_recent_messages(group_id, limit=limit)],
+                "unread": [
+                    message_payload_from_record(record)
+                    for record in STORE.get_unread_message_records(group_id, limit=limit)
+                ],
+                "recent": [
+                    message_payload_from_record(record)
+                    for record in STORE.list_recent_message_records(group_id, limit=limit)
+                ],
                 "summaries": STORE.list_summaries(group_id),
+            },
+        )
+
+    def _handle_history_get(self, group_id: str, query: dict[str, list[str]]) -> None:
+        group = STORE.get_group(group_id)
+        if not group:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Group not found"})
+            return
+
+        try:
+            requested_limit = int((query.get("limit") or [str(DEFAULT_HISTORY_LIMIT)])[0])
+        except (TypeError, ValueError):
+            requested_limit = DEFAULT_HISTORY_LIMIT
+        limit = min(max(requested_limit, 1), MAX_HISTORY_LIMIT)
+
+        before_timestamp: int | None = None
+        before_message_id: str | None = None
+        start_timestamp: int | None = None
+        end_timestamp: int | None = None
+        selected_date: str | None = None
+        if query.get("before_timestamp") and query.get("before_message_id"):
+            try:
+                before_timestamp = int(query["before_timestamp"][0])
+                before_message_id = str(query["before_message_id"][0])
+            except (TypeError, ValueError):
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "Invalid history cursor"})
+                return
+        if query.get("date"):
+            try:
+                start_timestamp, end_timestamp, selected_date = parse_history_date(query["date"][0])
+            except ValueError as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+
+        records = STORE.list_history_message_records(
+            group_id,
+            limit=limit + 1,
+            before_timestamp=before_timestamp,
+            before_message_id=before_message_id,
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+        )
+        has_more = len(records) > limit
+        records = records[-limit:]
+        messages = [message_payload_from_record(record) for record in records]
+        next_cursor = None
+        if has_more and messages:
+            first = messages[0]
+            next_cursor = {
+                "before_timestamp": first["timestamp"],
+                "before_message_id": first["message_id"],
+            }
+
+        self._json(
+            HTTPStatus.OK,
+            {
+                "group": group,
+                "messages": messages,
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+                "limit": limit,
+                "date": selected_date,
+            },
+        )
+
+    def _handle_group_delete(self, path: str, query: dict[str, list[str]]) -> None:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4 or parts[0] != "api" or parts[1] != "groups" or parts[3] != "history":
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+            return
+
+        group_id = parts[2]
+        group = STORE.get_group(group_id)
+        if not group:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Group not found"})
+            return
+        if not query.get("date"):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "Missing date"})
+            return
+
+        try:
+            start_timestamp, end_timestamp, selected_date = parse_history_date(query["date"][0])
+        except ValueError as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+
+        deleted_count = STORE.delete_message_records_in_range(group_id, start_timestamp, end_timestamp)
+        self._json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "group": group,
+                "date": selected_date,
+                "deleted_count": deleted_count,
             },
         )
 
@@ -124,18 +302,31 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
 
         body = self._read_json(default={})
-        limit = int(body.get("limit", 500))
+        try:
+            requested_limit = int(body.get("limit", DEFAULT_SUMMARY_LIMIT))
+        except (TypeError, ValueError):
+            requested_limit = DEFAULT_SUMMARY_LIMIT
+        limit = min(max(requested_limit, 1), MAX_SUMMARY_LIMIT)
         mark_read = bool(body.get("mark_read", True))
-        messages = STORE.get_unread_messages(group_id, limit=limit)
+        records = STORE.get_unread_message_records(group_id, limit=limit)
+        messages = [message_from_record(record) for record in records]
+        summary_messages = [
+            message
+            for message in (summary_message_from_record(record) for record in records)
+            if message is not None
+        ]
         if not messages:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "No unread messages to summarize"})
             return
 
-        try:
-            summary = SUMMARIZER.summarize(group["group_name"], messages)
-        except SummarizerError as exc:
-            self._json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
-            return
+        if summary_messages:
+            try:
+                summary = SUMMARIZER.summarize(group["group_name"], summary_messages)
+            except SummarizerError as exc:
+                self._json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+                return
+        else:
+            summary = MEDIA_ONLY_SUMMARY
 
         created_at = int(time.time())
         summary_id = STORE.save_summary(
@@ -161,7 +352,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         event = self._read_json(default={})
         if SETTINGS.webhook_debug:
             self._log_webhook_event(event)
-        message = parse_group_message(event)
+        message = parse_group_message(event, reply_lookup=STORE.get_message)
         if message is None:
             self._json(HTTPStatus.OK, {"ok": True, "ignored": True})
             return
@@ -264,12 +455,29 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 def run() -> None:
     STORE.init()
+    refresh_count = refresh_stored_cq_messages()
     address = (SETTINGS.host, SETTINGS.port)
     httpd = ThreadingHTTPServer(address, RequestHandler)
     print(f"QQ Message Summary running at http://{SETTINGS.host}:{SETTINGS.port}")
     print(f"SQLite database: {SETTINGS.database_path}")
     print(f"DeepSeek model: {SETTINGS.deepseek_model}")
+    if refresh_count:
+        print(f"Refreshed {refresh_count} stored CQ messages")
     httpd.serve_forever()
+
+
+def refresh_stored_cq_messages(limit: int = 5000) -> int:
+    refreshed = 0
+    for row in STORE.list_messages_with_raw_cq(limit=limit):
+        try:
+            raw = json.loads(row.get("raw_json") or "{}")
+        except json.JSONDecodeError:
+            continue
+        content = message_to_text(raw.get("raw_message"), raw.get("message"), STORE.get_message)
+        if content and content != row.get("content"):
+            STORE.update_message_content(str(row["message_id"]), content)
+            refreshed += 1
+    return refreshed
 
 
 if __name__ == "__main__":

@@ -45,10 +45,25 @@
             </div>
             <div id="summaryList" class="summary-list empty">暂无总结。</div>
           </section>
+
+          <section class="panel history-panel">
+            <div class="panel-header">
+              <div>
+                <h2>历史消息</h2>
+                <div class="history-controls">
+                  <input id="historyDate" type="date" aria-label="选择历史日期" />
+                  <button id="loadHistoryDateBtn" type="button">查看日期</button>
+                  <button id="clearHistoryDateBtn" type="button">最新</button>
+                  <button id="deleteHistoryDayBtn" class="danger-button" type="button" disabled>删除当天</button>
+                </div>
+              </div>
+              <span id="historyCount" class="count">0</span>
+            </div>
+            <div id="historyMessages" class="message-list history-list empty">还没有选择群。</div>
+          </section>
         </div>
       </section>
     </main>
     <script src="/static/app.js"></script>
   </body>
 </html>
-

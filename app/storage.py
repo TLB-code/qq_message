@@ -149,6 +149,40 @@ class Store:
             ).fetchone()
             return dict(row) if row else None
 
+    def get_message(self, message_id: str) -> Message | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT message_id, group_id, user_id, sender_name, content, timestamp
+                FROM messages
+                WHERE message_id = ?
+                """,
+                (message_id,),
+            ).fetchone()
+            return Message(**dict(row)) if row else None
+
+    def list_messages_with_raw_cq(self, limit: int = 1000) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT message_id, group_id, user_id, sender_name, content, timestamp, raw_json
+                FROM messages
+                WHERE content LIKE '%[CQ:%'
+                ORDER BY timestamp ASC, message_id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def update_message_content(self, message_id: str, content: str) -> bool:
+        with self.connect() as conn:
+            result = conn.execute(
+                "UPDATE messages SET content = ? WHERE message_id = ?",
+                (content, message_id),
+            )
+            return result.rowcount > 0
+
     def get_unread_messages(self, group_id: str, limit: int = 500) -> list[Message]:
         with self.connect() as conn:
             cursor = conn.execute(
@@ -193,6 +227,50 @@ class Store:
                 ).fetchall()
             return [Message(**dict(row)) for row in rows]
 
+    def get_unread_message_records(self, group_id: str, limit: int = 500) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                SELECT last_message_id, last_timestamp
+                FROM summary_cursors
+                WHERE group_id = ?
+                """,
+                (group_id,),
+            ).fetchone()
+            if cursor is None or cursor["last_timestamp"] is None:
+                rows = conn.execute(
+                    """
+                    SELECT message_id, group_id, user_id, sender_name, content, timestamp, raw_json
+                    FROM messages
+                    WHERE group_id = ?
+                    ORDER BY timestamp ASC, message_id ASC
+                    LIMIT ?
+                    """,
+                    (group_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT message_id, group_id, user_id, sender_name, content, timestamp, raw_json
+                    FROM messages
+                    WHERE group_id = ?
+                      AND (
+                        timestamp > ?
+                        OR (timestamp = ? AND message_id > ?)
+                      )
+                    ORDER BY timestamp ASC, message_id ASC
+                    LIMIT ?
+                    """,
+                    (
+                        group_id,
+                        cursor["last_timestamp"],
+                        cursor["last_timestamp"],
+                        cursor["last_message_id"] or "",
+                        limit,
+                    ),
+                ).fetchall()
+            return [dict(row) for row in rows]
+
     def list_recent_messages(self, group_id: str, limit: int = 50) -> list[Message]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -206,6 +284,100 @@ class Store:
                 (group_id, limit),
             ).fetchall()
             return [Message(**dict(row)) for row in reversed(rows)]
+
+    def list_recent_message_records(self, group_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT message_id, group_id, user_id, sender_name, content, timestamp, raw_json
+                FROM messages
+                WHERE group_id = ?
+                ORDER BY timestamp DESC, message_id DESC
+                LIMIT ?
+                """,
+                (group_id, limit),
+            ).fetchall()
+            return [dict(row) for row in reversed(rows)]
+
+    def list_history_message_records(
+        self,
+        group_id: str,
+        limit: int = 50,
+        before_timestamp: int | None = None,
+        before_message_id: str | None = None,
+        start_timestamp: int | None = None,
+        end_timestamp: int | None = None,
+    ) -> list[dict[str, Any]]:
+        limit = max(int(limit), 1)
+        filters = ["group_id = ?"]
+        params: list[Any] = [group_id]
+        if start_timestamp is not None:
+            filters.append("timestamp >= ?")
+            params.append(start_timestamp)
+        if end_timestamp is not None:
+            filters.append("timestamp < ?")
+            params.append(end_timestamp)
+        if before_timestamp is not None and before_message_id is not None:
+            filters.append("(timestamp < ? OR (timestamp = ? AND message_id < ?))")
+            params.extend([before_timestamp, before_timestamp, before_message_id])
+
+        where_clause = " AND ".join(filters)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT message_id, group_id, user_id, sender_name, content, timestamp, raw_json
+                FROM messages
+                WHERE {where_clause}
+                ORDER BY timestamp DESC, message_id DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+            return [dict(row) for row in reversed(rows)]
+
+    def count_message_records_in_range(
+        self,
+        group_id: str,
+        start_timestamp: int,
+        end_timestamp: int,
+    ) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM messages
+                WHERE group_id = ?
+                  AND timestamp >= ?
+                  AND timestamp < ?
+                """,
+                (group_id, start_timestamp, end_timestamp),
+            ).fetchone()
+            return int(row["count"] or 0)
+
+    def delete_message_records_in_range(
+        self,
+        group_id: str,
+        start_timestamp: int,
+        end_timestamp: int,
+    ) -> int:
+        with self.connect() as conn:
+            result = conn.execute(
+                """
+                DELETE FROM messages
+                WHERE group_id = ?
+                  AND timestamp >= ?
+                  AND timestamp < ?
+                """,
+                (group_id, start_timestamp, end_timestamp),
+            )
+            deleted_count = int(result.rowcount or 0)
+        if deleted_count:
+            vacuum_conn = sqlite3.connect(self.database_path)
+            try:
+                vacuum_conn.execute("VACUUM")
+            finally:
+                vacuum_conn.close()
+        return deleted_count
 
     def save_summary(
         self,
@@ -298,4 +470,3 @@ class Store:
                 (group_id, last.message_id, last.timestamp, now),
             )
         return {"last_message_id": last.message_id, "last_timestamp": last.timestamp}
-
