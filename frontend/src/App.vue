@@ -223,9 +223,9 @@ const SUMMARY_PAGE_SIZE = 5;
 const PANEL_IDS = ["unread", "summary", "history"];
 const PANEL_MIN_WEIGHT = 0.5;
 const PANEL_MIN_WIDTHS = {
-  unread: 260,
-  summary: 300,
-  history: 300,
+  unread: "var(--panel-min-unread, 260px)",
+  summary: "var(--panel-min-summary, 300px)",
+  history: "var(--panel-min-history, 300px)",
 };
 
 const groups = ref([]);
@@ -304,7 +304,7 @@ function panelColumn(panelId) {
   if (layout.collapsedPanels[panelId]) {
     return "54px";
   }
-  return `minmax(${PANEL_MIN_WIDTHS[panelId]}px, ${layout.panelWeights[panelId]}fr)`;
+  return `minmax(${PANEL_MIN_WIDTHS[panelId]}, ${layout.panelWeights[panelId]}fr)`;
 }
 
 function setStatus(message, type = "") {

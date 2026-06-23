@@ -1024,35 +1024,43 @@ button:disabled {
 
   .content-grid {
     display: grid;
-    grid-template-columns: 1fr !important;
-    gap: 12px;
+    --panel-min-unread: 82vw;
+    --panel-min-summary: 82vw;
+    --panel-min-history: 82vw;
+    gap: 0;
     min-height: 0;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scroll-snap-type: x proximity;
+    -webkit-overflow-scrolling: touch;
   }
 
   .panel-frame,
   .panel-frame:first-child,
   .panel-frame:last-child {
-    padding: 0;
+    padding: 0 6px;
+    scroll-snap-align: start;
   }
 
   .panel-resizer {
-    display: none;
+    display: flex;
+    pointer-events: none;
   }
 
   .panel-rail {
     position: static;
-    width: 100%;
-    min-height: 46px;
-    grid-auto-flow: column;
-    grid-auto-columns: max-content;
-    justify-content: start;
-    align-content: center;
-    padding: 0 12px;
-    writing-mode: horizontal-tb;
+    width: 44px;
+    min-height: calc(100vh - 178px);
+    grid-auto-flow: row;
+    grid-auto-columns: auto;
+    justify-content: center;
+    align-content: start;
+    padding: 14px 0;
+    writing-mode: vertical-rl;
   }
 
   .panel-collapse-button {
-    right: 12px;
+    right: 18px;
   }
 }
 
