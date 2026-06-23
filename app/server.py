@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import mimetypes
 import time
@@ -7,7 +8,9 @@ from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, quote, urlparse
+from urllib.request import Request, urlopen
 
 from .config import BASE_DIR, load_settings
 from .onebot import (
@@ -28,12 +31,21 @@ SUMMARIZER = DeepSeekClient(
     base_url=SETTINGS.deepseek_base_url,
     model=SETTINGS.deepseek_model,
 )
-STATIC_DIR = BASE_DIR / "app" / "static"
+STATIC_DIR = BASE_DIR / "frontend" / "dist"
 WEBHOOK_LOG_PATH = SETTINGS.database_path.parent / "webhook_events.log"
 DEFAULT_SUMMARY_LIMIT = 500
 MAX_SUMMARY_LIMIT = 500
 DEFAULT_HISTORY_LIMIT = 50
 MAX_HISTORY_LIMIT = 100
+MAX_MEDIA_BYTES = 20 * 1024 * 1024
+STATIC_CONTENT_TYPES = {
+    ".css": "text/css",
+    ".html": "text/html",
+    ".js": "text/javascript",
+    ".json": "application/json",
+    ".mjs": "text/javascript",
+    ".svg": "image/svg+xml",
+}
 MEDIA_ONLY_SUMMARY = "本批消息只有图片、表情等媒体内容，暂未纳入 AI 总结。"
 
 
@@ -59,13 +71,46 @@ def message_from_record(record: dict, content: str | None = None) -> Message:
 def message_payload_from_record(record: dict) -> dict:
     event = raw_event_from_record(record)
     payload = message_from_record(record).__dict__
-    payload["display_parts"] = message_display_parts(
+    display_parts = message_display_parts(
         event.get("raw_message"),
         event.get("message"),
         fallback_content=payload["content"],
         reply_lookup=STORE.get_message,
     )
+    for part in display_parts:
+        media_url = part.get("url")
+        if isinstance(media_url, str) and is_allowed_media_url(media_url):
+            part["proxy_url"] = media_proxy_url(media_url)
+    payload["display_parts"] = display_parts
     return payload
+
+
+def is_allowed_media_url(value: str) -> bool:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+
+    hostname = parsed.hostname.lower()
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        return False
+
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return True
+
+    return not (
+        address.is_loopback
+        or address.is_private
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    )
+
+
+def media_proxy_url(value: str) -> str:
+    return f"/api/media?url={quote(value, safe='')}"
 
 
 def summary_message_from_record(record: dict) -> Message | None:
@@ -101,11 +146,17 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/":
+        if parsed.path in ("", "/"):
             self._serve_static("index.html")
+            return
+        if parsed.path.startswith("/assets/"):
+            self._serve_static(parsed.path.lstrip("/"))
             return
         if parsed.path.startswith("/static/"):
             self._serve_static(parsed.path.removeprefix("/static/"))
+            return
+        if parsed.path == "/api/media":
+            self._handle_media_get(parse_qs(parsed.query))
             return
         if parsed.path == "/api/groups":
             self._json(HTTPStatus.OK, {"groups": STORE.list_groups()})
@@ -124,6 +175,48 @@ class RequestHandler(BaseHTTPRequestHandler):
             )
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+
+    def _handle_media_get(self, query: dict[str, list[str]]) -> None:
+        media_url = (query.get("url") or [""])[0]
+        if not media_url or not is_allowed_media_url(media_url):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "Invalid media URL"})
+            return
+
+        request = Request(
+            media_url,
+            headers={
+                "User-Agent": "QQSummary/0.1",
+                "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            },
+        )
+        try:
+            with urlopen(request, timeout=10) as response:
+                content_type = response.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0]
+                content_length = int(response.headers.get("Content-Length") or "0")
+                if content_length > MAX_MEDIA_BYTES:
+                    self._json(HTTPStatus.PAYLOAD_TOO_LARGE, {"error": "Media file is too large"})
+                    return
+
+                content = response.read(MAX_MEDIA_BYTES + 1)
+        except HTTPError as exc:
+            self._json(HTTPStatus.BAD_GATEWAY, {"error": f"Media request failed: {exc.code}"})
+            return
+        except (TimeoutError, URLError, OSError) as exc:
+            self._json(HTTPStatus.BAD_GATEWAY, {"error": f"Media request failed: {exc}"})
+            return
+
+        if len(content) > MAX_MEDIA_BYTES:
+            self._json(HTTPStatus.PAYLOAD_TOO_LARGE, {"error": "Media file is too large"})
+            return
+        if not content_type.startswith(("image/", "video/")):
+            content_type = "application/octet-stream"
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "private, max-age=3600")
+        self.end_headers()
+        self.wfile.write(content)
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -428,15 +521,20 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _serve_static(self, relative_path: str) -> None:
         safe_path = Path(relative_path).name if "/" not in relative_path else relative_path
-        file_path = (STATIC_DIR / safe_path).resolve()
-        if STATIC_DIR.resolve() not in file_path.parents and file_path != STATIC_DIR.resolve():
+        static_root = STATIC_DIR.resolve()
+        file_path = (static_root / safe_path).resolve()
+        try:
+            file_path.relative_to(static_root)
+        except ValueError:
             self._json(HTTPStatus.FORBIDDEN, {"error": "Forbidden"})
             return
         if not file_path.is_file():
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
             return
 
-        content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+        content_type = STATIC_CONTENT_TYPES.get(file_path.suffix.lower())
+        if content_type is None:
+            content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
         content = file_path.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
@@ -461,6 +559,7 @@ def run() -> None:
     print(f"QQ Message Summary running at http://{SETTINGS.host}:{SETTINGS.port}")
     print(f"SQLite database: {SETTINGS.database_path}")
     print(f"DeepSeek model: {SETTINGS.deepseek_model}")
+    print(f"Static frontend: {STATIC_DIR} ({'built' if (STATIC_DIR / 'index.html').is_file() else 'missing build'})")
     if refresh_count:
         print(f"Refreshed {refresh_count} stored CQ messages")
     httpd.serve_forever()

@@ -3,7 +3,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from app.onebot import message_display_parts, message_to_summary_text, parse_group_message
-from app.server import DEFAULT_SUMMARY_LIMIT, MAX_SUMMARY_LIMIT, summary_message_from_record
+from app.server import (
+    DEFAULT_SUMMARY_LIMIT,
+    MAX_SUMMARY_LIMIT,
+    is_allowed_media_url,
+    media_proxy_url,
+    message_payload_from_record,
+    summary_message_from_record,
+)
 from app.storage import Message, Store
 from app.summarizer import DeepSeekClient, build_summary_prompt, compact_messages, split_messages
 
@@ -154,6 +161,30 @@ class AppTests(unittest.TestCase):
         }
 
         self.assertIsNone(summary_message_from_record(record))
+
+    def test_message_payload_adds_media_proxy_url(self):
+        record = {
+            "message_id": "media-3",
+            "group_id": "1",
+            "user_id": "u1",
+            "sender_name": "sender",
+            "content": "[图片:pic.jpg]",
+            "timestamp": 1718000001,
+            "raw_json": (
+                '{"raw_message":"[CQ:image,file=pic.jpg,url=https://example.com/pic.jpg]",'
+                '"message":null}'
+            ),
+        }
+
+        payload = message_payload_from_record(record)
+
+        self.assertEqual(payload["display_parts"][0]["type"], "image")
+        self.assertEqual(payload["display_parts"][0]["proxy_url"], media_proxy_url("https://example.com/pic.jpg"))
+
+    def test_media_proxy_rejects_local_urls(self):
+        self.assertTrue(is_allowed_media_url("https://multimedia.nt.qq.com.cn/download?fileid=1"))
+        self.assertFalse(is_allowed_media_url("http://127.0.0.1:8000/private.png"))
+        self.assertFalse(is_allowed_media_url("http://localhost/private.png"))
 
     def test_store_tracks_unread_cursor(self):
         with TemporaryDirectory() as tmp:

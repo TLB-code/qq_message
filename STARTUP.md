@@ -23,9 +23,22 @@ QQ_SUMMARY_WEBHOOK_DEBUG=false
 
 Do not put your real key in `.env.example`.
 
-## 3. Start The Web Service
+## 3. Build The Frontend
+
+The web page is now a Vite + Vue app. Build it before starting the Python service:
 
 ```powershell
+cd D:\tim\Desktop\qq_message\frontend
+npm.cmd install
+npm.cmd run build
+```
+
+If you are only restarting the app after no frontend code changed, you can skip `npm.cmd install` and usually skip `npm.cmd run build`.
+
+## 4. Start The Web Service
+
+```powershell
+cd D:\tim\Desktop\qq_message
 python -m app.server
 ```
 
@@ -43,7 +56,7 @@ Health check:
 Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/health"
 ```
 
-## 4. Start NapCat
+## 5. Start NapCat
 
 Open another PowerShell window:
 
@@ -60,13 +73,13 @@ NapCat WebUI:
 http://127.0.0.1:6099/webui/?token=63d4a7435850
 ```
 
-## 5. Confirm QQ Login
+## 6. Confirm QQ Login
 
 If NapCat shows a QR code, scan it with QQ and authorize login.
 
 If it says the account is already logged in elsewhere, close the normal QQ client first, then retry NapCat login.
 
-## 6. Confirm NapCat Webhook
+## 7. Confirm NapCat Webhook
 
 NapCat should have an HTTP Client named:
 
@@ -89,7 +102,7 @@ reportSelfMessage: false
 token: empty
 ```
 
-## 7. Wait For Group Messages
+## 8. Wait For Group Messages
 
 This tool summarizes messages received after NapCat is connected. It does not automatically import old QQ unread messages from the QQ client.
 
@@ -151,6 +164,7 @@ Start again:
 
 ```powershell
 cd D:\tim\Desktop\qq_message
+npm.cmd --prefix frontend run build
 python -m app.server
 ```
 
@@ -217,4 +231,3 @@ data\webhook_events.log
 ```
 
 Turn it back off after debugging because this log contains message content.
-

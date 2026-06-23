@@ -18,7 +18,7 @@ The first version is intentionally small: it receives OneBot/NapCat group messag
 - A DeepSeek API key.
 - NapCatQQ or another OneBot-compatible QQ adapter.
 
-This project uses only the Python standard library for the MVP, so there is no dependency installation step.
+The backend uses only the Python standard library. The frontend is a Vite + Vue app in `frontend/`.
 
 ## Configuration
 
@@ -34,7 +34,18 @@ DeepSeek's current OpenAI-compatible base URL is `https://api.deepseek.com`.
 
 ## Run
 
+Install and build the frontend first:
+
 ```powershell
+cd D:\tim\Desktop\qq_message\frontend
+npm.cmd install
+npm.cmd run build
+```
+
+Then start the backend:
+
+```powershell
+cd D:\tim\Desktop\qq_message
 python -m app.server
 ```
 
