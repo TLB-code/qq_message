@@ -342,24 +342,39 @@ class Store:
             ).fetchall()
             return [dict(row) for row in reversed(rows)]
 
+    def count_message_records(
+        self,
+        group_id: str,
+        start_timestamp: int | None = None,
+        end_timestamp: int | None = None,
+    ) -> int:
+        filters = ["group_id = ?"]
+        params: list[Any] = [group_id]
+        if start_timestamp is not None:
+            filters.append("timestamp >= ?")
+            params.append(start_timestamp)
+        if end_timestamp is not None:
+            filters.append("timestamp < ?")
+            params.append(end_timestamp)
+
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM messages
+                WHERE {" AND ".join(filters)}
+                """,
+                params,
+            ).fetchone()
+            return int(row["count"] or 0)
+
     def count_message_records_in_range(
         self,
         group_id: str,
         start_timestamp: int,
         end_timestamp: int,
     ) -> int:
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM messages
-                WHERE group_id = ?
-                  AND timestamp >= ?
-                  AND timestamp < ?
-                """,
-                (group_id, start_timestamp, end_timestamp),
-            ).fetchone()
-            return int(row["count"] or 0)
+        return self.count_message_records(group_id, start_timestamp, end_timestamp)
 
     def delete_message_records_in_range(
         self,
@@ -468,6 +483,18 @@ class Store:
                 (*params, limit),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def count_summaries(self, group_id: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM summaries
+                WHERE group_id = ?
+                """,
+                (group_id,),
+            ).fetchone()
+            return int(row["count"] or 0)
 
     def mark_summary_read(self, group_id: str, summary_id: int) -> dict[str, Any] | None:
         with self.connect() as conn:

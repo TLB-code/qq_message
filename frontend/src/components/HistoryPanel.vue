@@ -3,9 +3,9 @@
     <div class="panel-header history-header">
       <div>
         <h2>历史消息</h2>
-        <p>默认显示最新消息，向上滚动继续加载</p>
+        <p>{{ loadedDate ? "当前日期" : "总共" }} {{ totalCount }} 条 · 已加载 {{ messages.length }} 条</p>
       </div>
-      <span class="count-badge">{{ messages.length }}</span>
+      <span class="count-badge">{{ totalCount }}</span>
     </div>
 
     <div class="history-tools">
@@ -57,6 +57,14 @@ defineProps({
   messages: {
     type: Array,
     required: true,
+  },
+  totalCount: {
+    type: Number,
+    default: 0,
+  },
+  loadedDate: {
+    type: String,
+    default: "",
   },
   date: {
     type: String,

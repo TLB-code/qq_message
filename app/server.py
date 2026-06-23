@@ -311,6 +311,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             {
                 "group": group,
                 "summaries": summaries,
+                "total_count": STORE.count_summaries(group_id),
                 "has_more": has_more,
                 "next_cursor": next_cursor,
                 "limit": limit,
@@ -356,6 +357,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             start_timestamp=start_timestamp,
             end_timestamp=end_timestamp,
         )
+        total_count = STORE.count_message_records(
+            group_id,
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+        )
         has_more = len(records) > limit
         records = records[-limit:]
         messages = [message_payload_from_record(record) for record in records]
@@ -372,6 +378,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             {
                 "group": group,
                 "messages": messages,
+                "total_count": total_count,
                 "has_more": has_more,
                 "next_cursor": next_cursor,
                 "limit": limit,

@@ -239,10 +239,14 @@ class AppTests(unittest.TestCase):
                 start_timestamp=100,
                 end_timestamp=200,
             )
+            total_count = store.count_message_records("1")
+            range_count = store.count_message_records("1", start_timestamp=100, end_timestamp=200)
             deleted_count = store.delete_message_records_in_range("1", 100, 200)
             remaining = store.list_history_message_records("1", limit=10)
 
             self.assertEqual([row["message_id"] for row in records], ["in-1", "in-2"])
+            self.assertEqual(total_count, 4)
+            self.assertEqual(range_count, 2)
             self.assertEqual(deleted_count, 2)
             self.assertEqual([row["message_id"] for row in remaining], ["old", "new"])
 
@@ -266,6 +270,7 @@ class AppTests(unittest.TestCase):
             first_page = store.list_summaries("1", limit=5)
             second_page = store.list_summaries("1", limit=5, before_id=first_page[-1]["id"])
 
+            self.assertEqual(store.count_summaries("1"), 7)
             self.assertEqual([row["summary"] for row in first_page], [
                 "summary 6",
                 "summary 5",

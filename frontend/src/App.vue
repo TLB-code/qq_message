@@ -120,7 +120,7 @@
           >
             <ScrollText :size="18" />
             <span>总结</span>
-            <strong>{{ summaries.length }}</strong>
+            <strong>{{ summaryTotalCount }}</strong>
             <ChevronRight :size="14" />
           </button>
           <template v-else>
@@ -129,6 +129,7 @@
             </button>
             <SummaryPanel
               :summaries="summaries"
+              :total-count="summaryTotalCount"
               :has-more="summaryHistory.hasMore"
               :loading="summaryHistory.isLoading"
               :marking-read-ids="markingSummaryReadIds"
@@ -162,7 +163,7 @@
           >
             <Archive :size="18" />
             <span>历史</span>
-            <strong>{{ history.messages.length }}</strong>
+            <strong>{{ historyTotalCount }}</strong>
             <ChevronRight :size="14" />
           </button>
           <template v-else>
@@ -173,6 +174,8 @@
               ref="historyPanel"
               v-model:date="history.date"
               :messages="history.messages"
+              :total-count="historyTotalCount"
+              :loaded-date="history.loadedDate"
               :has-more="history.hasMore"
               :loading="history.isLoading"
               @load-more="loadMoreHistory"
@@ -244,7 +247,9 @@ const history = reactive({
   hasMore: false,
   isLoading: false,
   initialized: false,
+  totalCount: 0,
   date: "",
+  loadedDate: "",
 });
 const summaryHistory = reactive({
   groupId: null,
@@ -253,6 +258,7 @@ const summaryHistory = reactive({
   hasMore: false,
   isLoading: false,
   initialized: false,
+  totalCount: 0,
 });
 const layout = reactive({
   sidebarCollapsed: false,
@@ -286,6 +292,11 @@ const selectedGroupStats = computed(() => {
   return {
     messageCount: found?.message_count || 0,
   };
+});
+const summaryTotalCount = computed(() => summaryHistory.totalCount);
+const historyTotalCount = computed(() => {
+  if (history.loadedDate) return history.totalCount;
+  return selectedGroupStats.value.messageCount || history.totalCount;
 });
 const canMutateUnread = computed(() => Boolean(selectedGroupId.value && unreadMessages.value.length && !isMutating.value));
 const canSummarize = computed(() => canMutateUnread.value);
@@ -383,7 +394,9 @@ function resetHistoryState(groupId, date = "") {
   history.hasMore = false;
   history.isLoading = false;
   history.initialized = false;
+  history.totalCount = 0;
   history.date = date;
+  history.loadedDate = date;
 }
 
 function resetSummaryState(groupId) {
@@ -393,6 +406,7 @@ function resetSummaryState(groupId) {
   summaryHistory.hasMore = false;
   summaryHistory.isLoading = false;
   summaryHistory.initialized = false;
+  summaryHistory.totalCount = 0;
 }
 
 async function loadGroups() {
@@ -429,6 +443,7 @@ async function loadHistoryMessages({ reset = false, date = history.date, preserv
     if (selectedGroupId.value !== groupId || history.groupId !== groupId) return;
 
     const messages = data.messages || [];
+    history.totalCount = Number(data.total_count || 0);
     if (reset) {
       history.messages = messages;
     } else {
@@ -471,6 +486,7 @@ async function loadSummaryHistory({ reset = false } = {}) {
     if (selectedGroupId.value !== groupId || summaryHistory.groupId !== groupId) return;
 
     const records = data.summaries || [];
+    summaryHistory.totalCount = Number(data.total_count || 0);
     if (reset) {
       summaryHistory.summaries = records;
     } else {
@@ -496,6 +512,7 @@ async function appendNewHistoryMessagesIfAtBottom() {
   const data = await getHistory(groupId, { limit: HISTORY_PAGE_SIZE });
   if (selectedGroupId.value !== groupId || history.groupId !== groupId) return;
 
+  history.totalCount = Number(data.total_count || 0);
   const known = new Set(history.messages.map((message) => message.message_id));
   const newer = (data.messages || []).filter((message) => !known.has(message.message_id));
   if (!newer.length) return;

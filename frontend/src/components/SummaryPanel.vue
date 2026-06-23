@@ -3,9 +3,9 @@
     <div class="panel-header">
       <div>
         <h2>总结历史</h2>
-        <p>每次加载 5 条，向下滚动查看更多</p>
+        <p>总共 {{ totalCount }} 条 · 已加载 {{ summaries.length }} 条</p>
       </div>
-      <span class="count-badge">{{ summaries.length }}</span>
+      <span class="count-badge">{{ totalCount }}</span>
     </div>
 
     <div v-if="summaries.length" class="summary-list" @scroll="handleScroll">
@@ -58,6 +58,10 @@ defineProps({
   summaries: {
     type: Array,
     required: true,
+  },
+  totalCount: {
+    type: Number,
+    default: 0,
   },
   hasMore: {
     type: Boolean,
