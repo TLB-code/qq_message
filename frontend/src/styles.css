@@ -624,6 +624,16 @@ button:disabled {
   font-weight: 800;
 }
 
+.summary-load-marker {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .summary-markdown {
   color: #172033;
   font-size: 14px;

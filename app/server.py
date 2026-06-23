@@ -37,6 +37,8 @@ DEFAULT_SUMMARY_LIMIT = 500
 MAX_SUMMARY_LIMIT = 500
 DEFAULT_HISTORY_LIMIT = 50
 MAX_HISTORY_LIMIT = 100
+DEFAULT_SUMMARY_HISTORY_LIMIT = 5
+MAX_SUMMARY_HISTORY_LIMIT = 20
 MAX_MEDIA_BYTES = 20 * 1024 * 1024
 STATIC_CONTENT_TYPES = {
     ".css": "text/css",
@@ -249,6 +251,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             if parts[3] == "history":
                 self._handle_history_get(group_id, query)
                 return
+            if parts[3] == "summaries":
+                self._handle_summaries_get(group_id, query)
+                return
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
             return
 
@@ -271,6 +276,44 @@ class RequestHandler(BaseHTTPRequestHandler):
                     for record in STORE.list_recent_message_records(group_id, limit=limit)
                 ],
                 "summaries": STORE.list_summaries(group_id),
+            },
+        )
+
+    def _handle_summaries_get(self, group_id: str, query: dict[str, list[str]]) -> None:
+        group = STORE.get_group(group_id)
+        if not group:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Group not found"})
+            return
+
+        try:
+            requested_limit = int((query.get("limit") or [str(DEFAULT_SUMMARY_HISTORY_LIMIT)])[0])
+        except (TypeError, ValueError):
+            requested_limit = DEFAULT_SUMMARY_HISTORY_LIMIT
+        limit = min(max(requested_limit, 1), MAX_SUMMARY_HISTORY_LIMIT)
+
+        before_id: int | None = None
+        if query.get("before_id"):
+            try:
+                before_id = int(query["before_id"][0])
+            except (TypeError, ValueError):
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "Invalid summary cursor"})
+                return
+
+        records = STORE.list_summaries(group_id, limit=limit + 1, before_id=before_id)
+        has_more = len(records) > limit
+        summaries = records[:limit]
+        next_cursor = None
+        if has_more and summaries:
+            next_cursor = {"before_id": summaries[-1]["id"]}
+
+        self._json(
+            HTTPStatus.OK,
+            {
+                "group": group,
+                "summaries": summaries,
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+                "limit": limit,
             },
         )
 

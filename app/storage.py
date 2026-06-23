@@ -436,18 +436,29 @@ class Store:
                 )
             return summary_id
 
-    def list_summaries(self, group_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    def list_summaries(
+        self,
+        group_id: str,
+        limit: int = 20,
+        before_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        filters = ["group_id = ?"]
+        params: list[Any] = [group_id]
+        if before_id is not None:
+            filters.append("id < ?")
+            params.append(before_id)
+
         with self.connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT id, group_id, from_message_id, to_message_id, from_timestamp,
                        to_timestamp, message_count, model, summary, created_at
                 FROM summaries
-                WHERE group_id = ?
-                ORDER BY created_at DESC, id DESC
+                WHERE {" AND ".join(filters)}
+                ORDER BY id DESC
                 LIMIT ?
                 """,
-                (group_id, limit),
+                (*params, limit),
             ).fetchall()
             return [dict(row) for row in rows]
 

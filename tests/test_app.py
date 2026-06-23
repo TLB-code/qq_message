@@ -246,6 +246,35 @@ class AppTests(unittest.TestCase):
             self.assertEqual(deleted_count, 2)
             self.assertEqual([row["message_id"] for row in remaining], ["old", "new"])
 
+    def test_store_pages_summaries_before_id(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "test.sqlite3")
+            store.init()
+            store.upsert_group("1", "test group", 100)
+            for index in range(7):
+                message = Message(str(index), "1", "u1", "user", f"message {index}", 100 + index)
+                store.save_message(message, {"message_id": index})
+                store.save_summary(
+                    "1",
+                    [message],
+                    f"summary {index}",
+                    "test-model",
+                    200 + index,
+                    mark_read=False,
+                )
+
+            first_page = store.list_summaries("1", limit=5)
+            second_page = store.list_summaries("1", limit=5, before_id=first_page[-1]["id"])
+
+            self.assertEqual([row["summary"] for row in first_page], [
+                "summary 6",
+                "summary 5",
+                "summary 4",
+                "summary 3",
+                "summary 2",
+            ])
+            self.assertEqual([row["summary"] for row in second_page], ["summary 1", "summary 0"])
+
     def test_compact_messages_keeps_content_under_limit(self):
         messages = [
             Message(str(i), "1", "u", "群友", f"消息 {i} " + "x" * 50, 1718000000 + i)

@@ -21,6 +21,15 @@ export function getGroupDetail(groupId, limit = 500) {
   return requestJson(`/api/groups/${encodeURIComponent(groupId)}?limit=${limit}`);
 }
 
+export function getSummaries(groupId, { cursor = null, limit = 5 } = {}) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (cursor) {
+    params.set("before_id", String(cursor.before_id));
+  }
+
+  return requestJson(`/api/groups/${encodeURIComponent(groupId)}/summaries?${params.toString()}`);
+}
+
 export function summarizeGroup(groupId, limit = 500) {
   return requestJson(`/api/groups/${encodeURIComponent(groupId)}/summarize`, {
     method: "POST",
