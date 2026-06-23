@@ -9,10 +9,18 @@
     </div>
 
     <div v-if="summaries.length" class="summary-list" @scroll="handleScroll">
-      <article v-for="(summary, index) in summaries" :key="summary.id" class="summary-card">
+      <article
+        v-for="(summary, index) in summaries"
+        :key="summary.id"
+        class="summary-card"
+        :class="{ unread: !summary.is_read }"
+      >
         <header class="summary-card-head">
           <div>
-            <h3>{{ index === 0 ? "最新总结" : `历史总结 #${summary.id}` }}</h3>
+            <div class="summary-title-row">
+              <h3>{{ index === 0 ? "最新总结" : `历史总结 #${summary.id}` }}</h3>
+              <span v-if="!summary.is_read" class="summary-unread-badge">未读</span>
+            </div>
             <p>{{ formatFullTime(summary.created_at) }} · {{ summary.model }}</p>
           </div>
           <div class="summary-card-actions">
@@ -27,7 +35,7 @@
               <Check v-if="summary.is_read" :size="14" />
               <LoaderCircle v-else-if="markingReadIds.includes(summary.id)" :size="14" class="spinning" />
               <Circle v-else :size="14" />
-              <span>{{ summary.is_read ? "已读" : "标记已读" }}</span>
+              <span>{{ summary.is_read ? "已读" : "未读" }}</span>
             </button>
           </div>
         </header>

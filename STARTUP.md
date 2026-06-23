@@ -1,31 +1,63 @@
-# Startup Guide
+# QQ 群消息总结工具启动流程
 
-This guide describes how to start the local QQ group summary tool after a reboot.
+这份文档用于记录从零启动本地项目的流程，包括 Python 后端、Vue 前端、NapCat 和 `.env` 配置说明。
 
-## 1. Open PowerShell
+## 1. 进入项目目录
+
+打开 PowerShell：
 
 ```powershell
 cd D:\tim\Desktop\qq_message
 ```
 
-## 2. Check `.env`
+## 2. 检查 `.env` 配置
 
-Make sure `D:\tim\Desktop\qq_message\.env` exists and contains your DeepSeek key:
+确认项目根目录存在：
 
 ```text
+D:\tim\Desktop\qq_message\.env
+```
+
+可以参考下面的配置：
+
+```env
 DEEPSEEK_API_KEY=sk-your-real-key
 DEEPSEEK_MODEL=deepseek-v4-flash
 DEEPSEEK_BASE_URL=https://api.deepseek.com
+
 QQ_SUMMARY_HOST=127.0.0.1
 QQ_SUMMARY_PORT=8000
+QQ_SUMMARY_DB=data/qq_summary.sqlite3
+
 QQ_SUMMARY_WEBHOOK_DEBUG=false
+QQ_SUMMARY_WEBHOOK_TOKEN=use-a-long-random-token
+QQ_SUMMARY_WEB_PASSWORD=use-a-strong-page-password
+
+QQ_SUMMARY_AUTO_SUMMARY_ENABLED=true
+QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD=500
 ```
 
-Do not put your real key in `.env.example`.
+不要把真实的 `DEEPSEEK_API_KEY`、`QQ_SUMMARY_WEBHOOK_TOKEN`、`QQ_SUMMARY_WEB_PASSWORD` 提交到 GitHub。
 
-## 3. Build The Frontend
+### `.env` 字段说明
 
-The web page is now a Vite + Vue app. Build it before starting the Python service:
+| 字段 | 是否必填 | 示例 | 说明 |
+| --- | --- | --- | --- |
+| `DEEPSEEK_API_KEY` | 是 | `sk-xxxx` | DeepSeek API Key，用来调用 AI 总结接口。没有这个字段时，后端可以启动，但点击总结会失败。 |
+| `DEEPSEEK_MODEL` | 否 | `deepseek-v4-flash` | DeepSeek 模型名称。不填时默认使用代码里的默认值。 |
+| `DEEPSEEK_BASE_URL` | 否 | `https://api.deepseek.com` | DeepSeek API 地址。正常使用官方 DeepSeek 时保持这个值即可。 |
+| `QQ_SUMMARY_HOST` | 否 | `127.0.0.1` | 后端监听地址。本地只给自己用时用 `127.0.0.1`；部署到服务器并需要外部访问时通常改成 `0.0.0.0`。 |
+| `QQ_SUMMARY_PORT` | 否 | `8000` | 后端监听端口。打开网页时访问的端口就是这个。 |
+| `QQ_SUMMARY_DB` | 否 | `data/qq_summary.sqlite3` | SQLite 数据库路径，用来保存群、消息、总结历史、自动总结开关等数据。不填时默认保存到 `data/qq_summary.sqlite3`。 |
+| `QQ_SUMMARY_WEBHOOK_DEBUG` | 否 | `false` | 是否记录 NapCat 推送过来的原始事件。调试时可以改成 `true`，会写入 `data/webhook_events.log`。日志里可能包含消息内容，平时建议保持 `false`。 |
+| `QQ_SUMMARY_WEBHOOK_TOKEN` | 建议填写 | `一串随机长密码` | NapCat 调用后端 webhook 时使用的校验 token。设置后，NapCat webhook URL 必须带上同样的 `token`，否则后端会拒绝消息。 |
+| `QQ_SUMMARY_WEB_PASSWORD` | 建议填写 | `一个网页登录密码` | 网页访问密码。设置后，打开页面需要先登录；不设置则网页接口不需要登录。部署到服务器时强烈建议设置。 |
+| `QQ_SUMMARY_AUTO_SUMMARY_ENABLED` | 否 | `true` | 是否全局启用后台自动总结功能。开启后，还需要在网页里给具体群聊打开“自动总结”，那个群才会自动总结。 |
+| `QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD` | 否 | `500` | 自动总结阈值。某个已开启自动总结的群，未读历史消息达到这个数量后，后台会自动总结最早的一批消息。 |
+
+## 3. 构建前端
+
+前端现在是 Vite + Vue 项目。第一次启动，或前端代码有修改时，执行：
 
 ```powershell
 cd D:\tim\Desktop\qq_message\frontend
@@ -33,120 +65,122 @@ npm.cmd install
 npm.cmd run build
 ```
 
-If you are only restarting the app after no frontend code changed, you can skip `npm.cmd install` and usually skip `npm.cmd run build`.
+如果只是重启后端，并且前端代码没有改，可以跳过 `npm.cmd install`，通常也可以跳过 `npm.cmd run build`。
 
-## 4. Start The Web Service
+## 4. 启动后端服务
+
+回到项目根目录：
 
 ```powershell
 cd D:\tim\Desktop\qq_message
 python -m app.server
 ```
 
-Keep this PowerShell window open.
+保持这个 PowerShell 窗口不要关闭。
 
-Open the summary page:
+打开网页：
 
 ```text
 http://127.0.0.1:8000
 ```
 
-Health check:
+如果设置了 `QQ_SUMMARY_WEB_PASSWORD`，页面会先进入登录界面，输入 `.env` 里的网页密码即可。
+
+检查服务是否正常：
 
 ```powershell
 Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/health"
 ```
 
-## 5. Start NapCat
+## 5. 启动 NapCat
 
-Open another PowerShell window:
+再打开一个 PowerShell 窗口：
 
 ```powershell
 cd D:\tim\Desktop\qq_message\tools\napcat\onekey\NapCat.44498.Shell
 .\napcat.bat
 ```
 
-Keep this window open too.
+保持这个窗口不要关闭。
 
-NapCat WebUI:
+NapCat WebUI 地址：
 
 ```text
 http://127.0.0.1:6099/webui/?token=63d4a7435850
 ```
 
-## 6. Confirm QQ Login
+如果 NapCat 显示二维码，使用 QQ 扫码登录。
 
-If NapCat shows a QR code, scan it with QQ and authorize login.
+## 6. 配置 NapCat Webhook
 
-If it says the account is already logged in elsewhere, close the normal QQ client first, then retry NapCat login.
-
-## 7. Confirm NapCat Webhook
-
-NapCat should have an HTTP Client named:
+NapCat 里需要有一个 HTTP Client，例如：
 
 ```text
 qq-message-summary
 ```
 
-It should point to:
+Webhook 地址填写：
 
 ```text
-http://127.0.0.1:8000/webhook/onebot
+http://127.0.0.1:8000/webhook/onebot?token=use-a-long-random-token
 ```
 
-Expected settings:
+其中 `token=use-a-long-random-token` 要和 `.env` 里的 `QQ_SUMMARY_WEBHOOK_TOKEN` 完全一致。
+
+推荐设置：
 
 ```text
 enable: true
 messagePostFormat: array
 reportSelfMessage: false
-token: empty
+token: 留空
 ```
 
-## 8. Wait For Group Messages
+这里 NapCat 自己的 `token` 字段可以留空，本项目使用 URL 里的 `token` 做校验。
 
-This tool summarizes messages received after NapCat is connected. It does not automatically import old QQ unread messages from the QQ client.
+## 7. 使用方式
 
-When new group messages arrive, refresh:
+这个工具只会记录 NapCat 连接之后收到的新群消息，不会自动导入 QQ 客户端里已经存在的旧未读消息。
 
-```text
-http://127.0.0.1:8000
-```
+基本流程：
 
-Then select a group and click:
+1. 后端服务保持运行。
+2. NapCat 保持登录。
+3. QQ 群里有新消息后，网页会自动刷新。
+4. 选择一个群。
+5. 点击“总结未读”进行总结。
 
-```text
-总结未读
-```
+如果这个群开启了自动总结，并且未读消息达到 `QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD`，后台会自动总结，不需要网页一直打开。
 
-## Useful Checks
+## 8. 常用检查命令
 
-Check groups currently stored:
+查看当前保存的群列表：
 
 ```powershell
 Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/groups" | ConvertTo-Json -Depth 10
 ```
 
-Check whether the DeepSeek key is loaded without printing the key:
+检查 DeepSeek Key 是否已经加载，不会打印真实 Key：
 
 ```powershell
 python -c "from app.config import load_settings; s=load_settings(); print(bool(s.deepseek_api_key))"
 ```
 
-Check NapCat WebUI port:
+检查 NapCat WebUI 端口：
 
 ```powershell
 Get-NetTCPConnection -LocalPort 6099 -ErrorAction SilentlyContinue
 ```
 
-Check web service port:
+检查后端端口：
 
 ```powershell
 Get-NetTCPConnection -LocalPort 8000 -ErrorAction SilentlyContinue
 ```
 
-## Restart Only The Web Service
+## 9. 只重启后端
 
-Find running web service processes:
+查找正在运行的后端进程：
 
 ```powershell
 Get-CimInstance Win32_Process -Filter "name = 'python.exe'" |
@@ -154,13 +188,13 @@ Get-CimInstance Win32_Process -Filter "name = 'python.exe'" |
   Select-Object ProcessId,CommandLine
 ```
 
-Stop them:
+停止对应进程：
 
 ```powershell
 Stop-Process -Id <PID> -Force
 ```
 
-Start again:
+重新启动：
 
 ```powershell
 cd D:\tim\Desktop\qq_message
@@ -168,66 +202,72 @@ npm.cmd --prefix frontend run build
 python -m app.server
 ```
 
-## Restart Only NapCat
+## 10. 只重启 NapCat
 
-Close the NapCat command window, or stop only processes under:
+关闭 NapCat 的 PowerShell 窗口，或者停止这个目录下启动的相关进程：
 
 ```text
 D:\tim\Desktop\qq_message\tools\napcat\onekey\NapCat.44498.Shell
 ```
 
-Then start again:
+然后重新启动：
 
 ```powershell
 cd D:\tim\Desktop\qq_message\tools\napcat\onekey\NapCat.44498.Shell
 .\napcat.bat
 ```
 
-## Troubleshooting
+## 11. 常见问题
 
-### Page Has No New Groups
+### 页面没有新群或新消息
 
-Check whether NapCat is logged in and whether new QQ group messages arrived after startup.
+先确认 NapCat 已经登录，并且 QQ 群里有 NapCat 启动之后的新消息。
 
-Then check:
+然后检查：
 
 ```powershell
 Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/groups" | ConvertTo-Json -Depth 10
 ```
 
-### DeepSeek Says API Key Is Missing
+### 提示 DeepSeek API Key 缺失
 
-Confirm `.env` is in:
+确认 `.env` 文件在：
 
 ```text
 D:\tim\Desktop\qq_message\.env
 ```
 
-Then restart the web service.
+然后重启后端服务。
 
-### Summary Fails
+### 总结失败
 
-Check that the model and base URL are:
+先检查模型和 API 地址：
 
-```text
+```env
 DEEPSEEK_MODEL=deepseek-v4-flash
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 ```
 
-Then retry `总结未读`.
+然后重新点击“总结未读”。
 
-### Need Raw Webhook Debug Logs
+### 需要查看原始 webhook 数据
 
-Set this in `.env`:
+把 `.env` 改成：
 
-```text
+```env
 QQ_SUMMARY_WEBHOOK_DEBUG=true
 ```
 
-Restart the web service. Raw webhook events will be written to:
+重启后端后，原始事件会写入：
 
 ```text
 data\webhook_events.log
 ```
 
-Turn it back off after debugging because this log contains message content.
+调试结束后建议改回：
+
+```env
+QQ_SUMMARY_WEBHOOK_DEBUG=false
+```
+
+因为这个日志可能包含真实聊天内容。

@@ -45,7 +45,10 @@
             <span class="group-avatar">{{ group.group_name?.slice(0, 1) || "群" }}</span>
             <span class="group-copy">
               <span class="group-name">{{ group.group_name || group.group_id }}</span>
-              <span class="group-stats">{{ group.message_count || 0 }} 条本地消息</span>
+              <span class="group-stats">
+                <span>{{ group.message_count || 0 }} 条本地消息</span>
+                <span v-if="group.auto_summary_enabled" class="group-auto-badge">自动</span>
+              </span>
             </span>
           </span>
           <span class="unread-pill" :class="{ quiet: !group.unread_count }">

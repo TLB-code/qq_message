@@ -5,11 +5,18 @@ from tempfile import TemporaryDirectory
 from app.onebot import message_display_parts, message_to_summary_text, parse_group_message
 from app.server import (
     DEFAULT_SUMMARY_LIMIT,
+    MEDIA_ONLY_SUMMARY,
     MAX_SUMMARY_LIMIT,
+    create_web_session,
+    enqueue_auto_summary_if_needed,
+    is_valid_web_session,
     is_allowed_media_url,
     media_proxy_url,
     message_payload_from_record,
+    revoke_web_session,
+    summarize_group_messages,
     summary_message_from_record,
+    webhook_token_matches,
 )
 from app.storage import Message, Store
 from app.summarizer import DeepSeekClient, build_summary_prompt, compact_messages, split_messages
@@ -186,6 +193,30 @@ class AppTests(unittest.TestCase):
         self.assertFalse(is_allowed_media_url("http://127.0.0.1:8000/private.png"))
         self.assertFalse(is_allowed_media_url("http://localhost/private.png"))
 
+    def test_webhook_token_matching(self):
+        import app.server as server
+
+        original_token = server.SETTINGS.webhook_token
+        try:
+            object.__setattr__(server.SETTINGS, "webhook_token", None)
+            self.assertTrue(webhook_token_matches(None))
+
+            object.__setattr__(server.SETTINGS, "webhook_token", "secret-token")
+            self.assertTrue(webhook_token_matches("secret-token"))
+            self.assertFalse(webhook_token_matches("wrong-token"))
+            self.assertFalse(webhook_token_matches(None))
+        finally:
+            object.__setattr__(server.SETTINGS, "webhook_token", original_token)
+
+    def test_web_session_can_be_revoked(self):
+        token = create_web_session()
+
+        self.assertTrue(is_valid_web_session(token))
+
+        revoke_web_session(token)
+
+        self.assertFalse(is_valid_web_session(token))
+
     def test_store_tracks_unread_cursor(self):
         with TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "test.sqlite3")
@@ -200,6 +231,103 @@ class AppTests(unittest.TestCase):
             store.save_summary("1", unread[:1], "第一条总结", "test-model", 102)
             unread_after_summary = store.get_unread_messages("1")
             self.assertEqual([message.message_id for message in unread_after_summary], ["2"])
+
+    def test_store_counts_unread_records(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "test.sqlite3")
+            store.init()
+            store.upsert_group("1", "test group", 100)
+            for index in range(4):
+                store.save_message(
+                    Message(str(index), "1", "u1", "user", f"message {index}", 100 + index),
+                    {"message_id": index},
+                )
+
+            self.assertEqual(store.count_unread_message_records("1"), 4)
+
+            first_two = store.get_unread_messages("1", limit=2)
+            store.save_summary("1", first_two, "summary", "test-model", 200)
+
+            self.assertEqual(store.count_unread_message_records("1"), 2)
+
+    def test_store_group_auto_summary_defaults_off_and_can_toggle(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "test.sqlite3")
+            store.init()
+            store.upsert_group("1", "test group", 100)
+
+            group = store.get_group("1")
+            self.assertEqual(group["auto_summary_enabled"], 0)
+            self.assertFalse(store.is_group_auto_summary_enabled("1"))
+
+            updated = store.set_group_auto_summary_enabled("1", True)
+            self.assertEqual(updated["auto_summary_enabled"], 1)
+            self.assertTrue(store.is_group_auto_summary_enabled("1"))
+
+    def test_summarize_group_messages_saves_media_only_summary(self):
+        with TemporaryDirectory() as tmp:
+            import app.server as server
+
+            original_store = server.STORE
+            store = Store(Path(tmp) / "test.sqlite3")
+            store.init()
+            store.upsert_group("1", "test group", 100)
+            store.save_message(
+                Message("1", "1", "u1", "user", "[图片:pic.jpg]", 100),
+                {
+                    "message_id": "1",
+                    "raw_message": "[CQ:image,file=pic.jpg]",
+                    "message": None,
+                },
+            )
+
+            try:
+                server.STORE = store
+                result = summarize_group_messages("1", limit=500)
+            finally:
+                server.STORE = original_store
+
+            self.assertEqual(result["summary"], MEDIA_ONLY_SUMMARY)
+            self.assertEqual(result["message_count"], 1)
+            self.assertEqual(store.count_unread_message_records("1"), 0)
+
+    def test_auto_summary_enqueue_requires_threshold(self):
+        with TemporaryDirectory() as tmp:
+            import app.server as server
+
+            original_store = server.STORE
+            original_threshold = server.SETTINGS.auto_summary_threshold
+            original_enabled = server.SETTINGS.auto_summary_enabled
+            store = Store(Path(tmp) / "test.sqlite3")
+            store.init()
+            store.upsert_group("1", "test group", 100)
+            for index in range(3):
+                store.save_message(
+                    Message(str(index), "1", "u1", "user", f"message {index}", 100 + index),
+                    {"message_id": index},
+                )
+
+            try:
+                server.STORE = store
+                object.__setattr__(server.SETTINGS, "auto_summary_enabled", True)
+                object.__setattr__(server.SETTINGS, "auto_summary_threshold", 3)
+                server.AUTO_SUMMARY_QUEUED_GROUPS.clear()
+                while not server.AUTO_SUMMARY_QUEUE.empty():
+                    server.AUTO_SUMMARY_QUEUE.get_nowait()
+                    server.AUTO_SUMMARY_QUEUE.task_done()
+
+                self.assertFalse(enqueue_auto_summary_if_needed("1"))
+                store.set_group_auto_summary_enabled("1", True)
+                self.assertTrue(enqueue_auto_summary_if_needed("1"))
+                self.assertFalse(enqueue_auto_summary_if_needed("1"))
+            finally:
+                server.AUTO_SUMMARY_QUEUED_GROUPS.clear()
+                while not server.AUTO_SUMMARY_QUEUE.empty():
+                    server.AUTO_SUMMARY_QUEUE.get_nowait()
+                    server.AUTO_SUMMARY_QUEUE.task_done()
+                server.STORE = original_store
+                object.__setattr__(server.SETTINGS, "auto_summary_enabled", original_enabled)
+                object.__setattr__(server.SETTINGS, "auto_summary_threshold", original_threshold)
 
     def test_store_pages_history_before_cursor(self):
         with TemporaryDirectory() as tmp:

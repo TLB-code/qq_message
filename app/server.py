@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import hmac
 import ipaddress
 import json
 import mimetypes
+import queue
+import secrets
+import threading
 import time
 from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from http.cookies import SimpleCookie
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
@@ -49,6 +54,15 @@ STATIC_CONTENT_TYPES = {
     ".svg": "image/svg+xml",
 }
 MEDIA_ONLY_SUMMARY = "本批消息只有图片、表情等媒体内容，暂未纳入 AI 总结。"
+AUTO_SUMMARY_QUEUE: queue.Queue[str] = queue.Queue()
+AUTO_SUMMARY_QUEUED_GROUPS: set[str] = set()
+AUTO_SUMMARY_QUEUE_LOCK = threading.Lock()
+AUTO_SUMMARY_WORKER_STARTED = False
+SUMMARY_LOCKS: dict[str, threading.Lock] = {}
+SUMMARY_LOCKS_LOCK = threading.Lock()
+WEB_SESSION_COOKIE = "qq_summary_session"
+WEB_SESSION_TOKENS: set[str] = set()
+WEB_SESSION_LOCK = threading.Lock()
 
 
 def raw_event_from_record(record: dict) -> dict:
@@ -140,6 +154,156 @@ def parse_history_date(value: str) -> tuple[int, int, str]:
     return int(started_at.timestamp()), int(ended_at.timestamp()), day.isoformat()
 
 
+def web_auth_enabled() -> bool:
+    return bool(SETTINGS.web_password)
+
+
+def create_web_session() -> str:
+    token = secrets.token_urlsafe(32)
+    with WEB_SESSION_LOCK:
+        WEB_SESSION_TOKENS.add(token)
+    return token
+
+
+def revoke_web_session(token: str | None) -> None:
+    if not token:
+        return
+    with WEB_SESSION_LOCK:
+        WEB_SESSION_TOKENS.discard(token)
+
+
+def is_valid_web_session(token: str | None) -> bool:
+    if not token:
+        return False
+    with WEB_SESSION_LOCK:
+        return token in WEB_SESSION_TOKENS
+
+
+def webhook_token_matches(value: str | None) -> bool:
+    expected = SETTINGS.webhook_token
+    if not expected:
+        return True
+    return bool(value and hmac.compare_digest(value, expected))
+
+
+def summary_lock_for_group(group_id: str) -> threading.Lock:
+    with SUMMARY_LOCKS_LOCK:
+        lock = SUMMARY_LOCKS.get(group_id)
+        if lock is None:
+            lock = threading.Lock()
+            SUMMARY_LOCKS[group_id] = lock
+        return lock
+
+
+def summarize_group_messages(group_id: str, limit: int, mark_read: bool = True) -> dict:
+    group = STORE.get_group(group_id)
+    if not group:
+        raise ValueError("Group not found")
+
+    records = STORE.get_unread_message_records(group_id, limit=limit)
+    messages = [message_from_record(record) for record in records]
+    summary_messages = [
+        message
+        for message in (summary_message_from_record(record) for record in records)
+        if message is not None
+    ]
+    if not messages:
+        raise ValueError("No unread messages to summarize")
+
+    if summary_messages:
+        summary = SUMMARIZER.summarize(group["group_name"], summary_messages)
+    else:
+        summary = MEDIA_ONLY_SUMMARY
+
+    created_at = int(time.time())
+    summary_id = STORE.save_summary(
+        group_id=group_id,
+        messages=messages,
+        summary=summary,
+        model=SETTINGS.deepseek_model,
+        created_at=created_at,
+        mark_read=mark_read,
+    )
+    return {
+        "summary_id": summary_id,
+        "summary": summary,
+        "message_count": len(messages),
+        "model": SETTINGS.deepseek_model,
+    }
+
+
+def enqueue_auto_summary_if_needed(group_id: str) -> bool:
+    if not SETTINGS.auto_summary_enabled:
+        return False
+    if not STORE.is_group_auto_summary_enabled(group_id):
+        return False
+
+    unread_count = STORE.count_unread_message_records(group_id)
+    if unread_count < SETTINGS.auto_summary_threshold:
+        return False
+
+    with AUTO_SUMMARY_QUEUE_LOCK:
+        if group_id in AUTO_SUMMARY_QUEUED_GROUPS:
+            return False
+        AUTO_SUMMARY_QUEUED_GROUPS.add(group_id)
+        AUTO_SUMMARY_QUEUE.put(group_id)
+        return True
+
+
+def auto_summary_worker() -> None:
+    while True:
+        group_id = AUTO_SUMMARY_QUEUE.get()
+        try:
+            lock = summary_lock_for_group(group_id)
+            with lock:
+                while (
+                    SETTINGS.auto_summary_enabled
+                    and STORE.is_group_auto_summary_enabled(group_id)
+                    and STORE.count_unread_message_records(group_id) >= SETTINGS.auto_summary_threshold
+                ):
+                    try:
+                        result = summarize_group_messages(
+                            group_id,
+                            limit=SETTINGS.auto_summary_threshold,
+                            mark_read=True,
+                        )
+                    except SummarizerError as exc:
+                        print(f"Auto summary failed for group {group_id}: {exc}")
+                        break
+                    except ValueError as exc:
+                        print(f"Auto summary skipped for group {group_id}: {exc}")
+                        break
+                    except Exception as exc:
+                        print(f"Auto summary crashed for group {group_id}: {exc}")
+                        break
+                    print(
+                        "Auto summarized "
+                        f"{result['message_count']} messages for group {group_id} "
+                        f"as summary #{result['summary_id']}"
+                    )
+        finally:
+            with AUTO_SUMMARY_QUEUE_LOCK:
+                AUTO_SUMMARY_QUEUED_GROUPS.discard(group_id)
+            AUTO_SUMMARY_QUEUE.task_done()
+
+
+def start_auto_summary_worker() -> None:
+    global AUTO_SUMMARY_WORKER_STARTED
+    if AUTO_SUMMARY_WORKER_STARTED:
+        return
+    AUTO_SUMMARY_WORKER_STARTED = True
+    worker = threading.Thread(target=auto_summary_worker, name="auto-summary-worker", daemon=True)
+    worker.start()
+
+
+def enqueue_existing_auto_summaries() -> int:
+    count = 0
+    for group in STORE.list_groups():
+        if enqueue_auto_summary_if_needed(str(group["group_id"])):
+            count += 1
+    return count
+
+
 class RequestHandler(BaseHTTPRequestHandler):
     server_version = "QQSummary/0.1"
 
@@ -148,6 +312,9 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/auth/status":
+            self._handle_auth_status()
+            return
         if parsed.path in ("", "/"):
             self._serve_static("index.html")
             return
@@ -156,6 +323,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/static/"):
             self._serve_static(parsed.path.removeprefix("/static/"))
+            return
+        if not self._require_web_auth(parsed.path):
             return
         if parsed.path == "/api/media":
             self._handle_media_get(parse_qs(parsed.query))
@@ -173,6 +342,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "database": str(SETTINGS.database_path),
                     "model": SETTINGS.deepseek_model,
+                    "auto_summary_enabled": SETTINGS.auto_summary_enabled,
+                    "auto_summary_threshold": SETTINGS.auto_summary_threshold,
                 },
             )
             return
@@ -222,8 +393,16 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/auth/login":
+            self._handle_auth_login()
+            return
+        if parsed.path == "/api/auth/logout":
+            self._handle_auth_logout()
+            return
         if parsed.path == "/webhook/onebot":
-            self._handle_onebot_webhook()
+            self._handle_onebot_webhook(parse_qs(parsed.query))
+            return
+        if not self._require_web_auth(parsed.path):
             return
         if parsed.path.startswith("/api/groups/"):
             self._handle_group_post(parsed.path)
@@ -232,10 +411,77 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
+        if not self._require_web_auth(parsed.path):
+            return
         if parsed.path.startswith("/api/groups/"):
             self._handle_group_delete(parsed.path, parse_qs(parsed.query))
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+
+    def _handle_auth_status(self) -> None:
+        authenticated = (not web_auth_enabled()) or is_valid_web_session(self._web_session_token())
+        self._json(
+            HTTPStatus.OK,
+            {
+                "auth_required": web_auth_enabled(),
+                "authenticated": authenticated,
+            },
+        )
+
+    def _handle_auth_login(self) -> None:
+        if not web_auth_enabled():
+            self._json(HTTPStatus.OK, {"ok": True, "auth_required": False, "authenticated": True})
+            return
+
+        body = self._read_json(default={})
+        password = str(body.get("password") or "")
+        if not hmac.compare_digest(password, SETTINGS.web_password or ""):
+            self._json(HTTPStatus.UNAUTHORIZED, {"error": "Invalid password"})
+            return
+
+        session_token = create_web_session()
+        self._json(
+            HTTPStatus.OK,
+            {"ok": True, "auth_required": True, "authenticated": True},
+            cookies=[self._session_cookie(session_token)],
+        )
+
+    def _handle_auth_logout(self) -> None:
+        revoke_web_session(self._web_session_token())
+        self._json(
+            HTTPStatus.OK,
+            {"ok": True},
+            cookies=[self._expired_session_cookie()],
+        )
+
+    def _require_web_auth(self, path: str) -> bool:
+        if not web_auth_enabled():
+            return True
+        if path.startswith("/api/auth/"):
+            return True
+        if is_valid_web_session(self._web_session_token()):
+            return True
+        if path.startswith("/api/"):
+            self._json(HTTPStatus.UNAUTHORIZED, {"error": "Login required"})
+        else:
+            self._serve_static("index.html")
+        return False
+
+    def _web_session_token(self) -> str | None:
+        cookie_header = self.headers.get("Cookie")
+        if not cookie_header:
+            return None
+        cookie = SimpleCookie()
+        cookie.load(cookie_header)
+        morsel = cookie.get(WEB_SESSION_COOKIE)
+        return morsel.value if morsel else None
+
+    def _session_cookie(self, token: str) -> str:
+        secure = " Secure;" if self.headers.get("X-Forwarded-Proto", "").lower() == "https" else ""
+        return f"{WEB_SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000;{secure}"
+
+    def _expired_session_cookie(self) -> str:
+        return f"{WEB_SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0;"
 
     def _handle_group_get(self, path: str, query: dict[str, list[str]]) -> None:
         parts = path.strip("/").split("/")
@@ -436,6 +682,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         if action == "summarize":
             self._summarize_group(group_id)
             return
+        if action == "auto-summary":
+            self._set_group_auto_summary(group_id)
+            return
         if action == "mark-read":
             try:
                 result = STORE.mark_read(group_id, now=int(time.time()))
@@ -445,6 +694,32 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK, {"ok": True, **result})
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+
+    def _set_group_auto_summary(self, group_id: str) -> None:
+        group = STORE.get_group(group_id)
+        if not group:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Group not found"})
+            return
+
+        body = self._read_json(default={})
+        enabled = bool(body.get("enabled"))
+        updated_group = STORE.set_group_auto_summary_enabled(group_id, enabled)
+        if updated_group is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Group not found"})
+            return
+
+        auto_summary_enqueued = False
+        if enabled:
+            auto_summary_enqueued = enqueue_auto_summary_if_needed(group_id)
+
+        self._json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "group": updated_group,
+                "auto_summary_enqueued": auto_summary_enqueued,
+            },
+        )
 
     def _mark_summary_read(self, group_id: str, summary_id_text: str) -> None:
         group = STORE.get_group(group_id)
@@ -466,11 +741,6 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.OK, {"ok": True, "group": group, "summary": summary})
 
     def _summarize_group(self, group_id: str) -> None:
-        group = STORE.get_group(group_id)
-        if not group:
-            self._json(HTTPStatus.NOT_FOUND, {"error": "Group not found"})
-            return
-
         body = self._read_json(default={})
         try:
             requested_limit = int(body.get("limit", DEFAULT_SUMMARY_LIMIT))
@@ -478,47 +748,33 @@ class RequestHandler(BaseHTTPRequestHandler):
             requested_limit = DEFAULT_SUMMARY_LIMIT
         limit = min(max(requested_limit, 1), MAX_SUMMARY_LIMIT)
         mark_read = bool(body.get("mark_read", True))
-        records = STORE.get_unread_message_records(group_id, limit=limit)
-        messages = [message_from_record(record) for record in records]
-        summary_messages = [
-            message
-            for message in (summary_message_from_record(record) for record in records)
-            if message is not None
-        ]
-        if not messages:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "No unread messages to summarize"})
-            return
 
-        if summary_messages:
+        lock = summary_lock_for_group(group_id)
+        with lock:
             try:
-                summary = SUMMARIZER.summarize(group["group_name"], summary_messages)
+                result = summarize_group_messages(group_id, limit=limit, mark_read=mark_read)
+            except ValueError as exc:
+                status = HTTPStatus.NOT_FOUND if str(exc) == "Group not found" else HTTPStatus.BAD_REQUEST
+                self._json(status, {"error": str(exc)})
+                return
             except SummarizerError as exc:
                 self._json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
                 return
-        else:
-            summary = MEDIA_ONLY_SUMMARY
 
-        created_at = int(time.time())
-        summary_id = STORE.save_summary(
-            group_id=group_id,
-            messages=messages,
-            summary=summary,
-            model=SETTINGS.deepseek_model,
-            created_at=created_at,
-            mark_read=mark_read,
-        )
         self._json(
             HTTPStatus.OK,
             {
                 "ok": True,
-                "summary_id": summary_id,
-                "summary": summary,
-                "message_count": len(messages),
-                "model": SETTINGS.deepseek_model,
+                **result,
             },
         )
 
-    def _handle_onebot_webhook(self) -> None:
+    def _handle_onebot_webhook(self, query: dict[str, list[str]]) -> None:
+        token = (query.get("token") or [""])[0] or self.headers.get("X-QQ-Summary-Token")
+        if not webhook_token_matches(token):
+            self._json(HTTPStatus.UNAUTHORIZED, {"error": "Invalid webhook token"})
+            return
+
         event = self._read_json(default={})
         if SETTINGS.webhook_debug:
             self._log_webhook_event(event)
@@ -530,11 +786,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         group_name = group_name_from_event(event, message.group_id)
         STORE.upsert_group(message.group_id, group_name, message.timestamp)
         inserted = STORE.save_message(message, event)
+        auto_summary_enqueued = False
+        if inserted:
+            auto_summary_enqueued = enqueue_auto_summary_if_needed(message.group_id)
         self._json(
             HTTPStatus.OK,
             {
                 "ok": True,
                 "inserted": inserted,
+                "auto_summary_enqueued": auto_summary_enqueued,
                 "message_id": message.message_id,
                 "group_id": message.group_id,
             },
@@ -619,26 +879,37 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
-    def _json(self, status: HTTPStatus, payload: dict) -> None:
+    def _json(self, status: HTTPStatus, payload: dict, cookies: list[str] | None = None) -> None:
         content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
+        for cookie in cookies or []:
+            self.send_header("Set-Cookie", cookie)
         self.end_headers()
         self.wfile.write(content)
 
 
 def run() -> None:
     STORE.init()
+    start_auto_summary_worker()
     refresh_count = refresh_stored_cq_messages()
+    auto_summary_count = enqueue_existing_auto_summaries()
     address = (SETTINGS.host, SETTINGS.port)
     httpd = ThreadingHTTPServer(address, RequestHandler)
     print(f"QQ Message Summary running at http://{SETTINGS.host}:{SETTINGS.port}")
     print(f"SQLite database: {SETTINGS.database_path}")
     print(f"DeepSeek model: {SETTINGS.deepseek_model}")
+    print(
+        "Auto summary: "
+        f"{'enabled' if SETTINGS.auto_summary_enabled else 'disabled'} "
+        f"(threshold {SETTINGS.auto_summary_threshold})"
+    )
     print(f"Static frontend: {STATIC_DIR} ({'built' if (STATIC_DIR / 'index.html').is_file() else 'missing build'})")
     if refresh_count:
         print(f"Refreshed {refresh_count} stored CQ messages")
+    if auto_summary_count:
+        print(f"Queued {auto_summary_count} group(s) for automatic summary")
     httpd.serve_forever()
 
 

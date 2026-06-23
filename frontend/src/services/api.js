@@ -1,16 +1,37 @@
 async function requestJson(url, options = {}) {
   const response = await fetch(url, {
     headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
     ...options,
   });
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
 
   if (!response.ok) {
-    throw new Error(data.error || `请求失败：${response.status}`);
+    const error = new Error(data.error || `请求失败：${response.status}`);
+    error.status = response.status;
+    throw error;
   }
 
   return data;
+}
+
+export function getAuthStatus() {
+  return requestJson("/api/auth/status");
+}
+
+export function login(password) {
+  return requestJson("/api/auth/login", {
+    method: "POST",
+    body: JSON.stringify({ password }),
+  });
+}
+
+export function logout() {
+  return requestJson("/api/auth/logout", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
 }
 
 export function listGroups() {
@@ -51,6 +72,13 @@ export function markGroupRead(groupId) {
   return requestJson(`/api/groups/${encodeURIComponent(groupId)}/mark-read`, {
     method: "POST",
     body: JSON.stringify({}),
+  });
+}
+
+export function setGroupAutoSummary(groupId, enabled) {
+  return requestJson(`/api/groups/${encodeURIComponent(groupId)}/auto-summary`, {
+    method: "POST",
+    body: JSON.stringify({ enabled }),
   });
 }
 

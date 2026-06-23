@@ -40,6 +40,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS groups (
                     group_id TEXT PRIMARY KEY,
                     group_name TEXT NOT NULL,
+                    auto_summary_enabled INTEGER NOT NULL DEFAULT 0,
                     updated_at INTEGER NOT NULL
                 );
 
@@ -81,6 +82,12 @@ class Store:
                 );
                 """
             )
+            group_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(groups)").fetchall()
+            }
+            if "auto_summary_enabled" not in group_columns:
+                conn.execute("ALTER TABLE groups ADD COLUMN auto_summary_enabled INTEGER NOT NULL DEFAULT 0")
             columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(summaries)").fetchall()
@@ -128,6 +135,7 @@ class Store:
                 SELECT
                     g.group_id,
                     g.group_name,
+                    g.auto_summary_enabled,
                     g.updated_at,
                     COUNT(m.message_id) AS message_count,
                     SUM(
@@ -151,10 +159,37 @@ class Store:
     def get_group(self, group_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT group_id, group_name, updated_at FROM groups WHERE group_id = ?",
+                "SELECT group_id, group_name, auto_summary_enabled, updated_at FROM groups WHERE group_id = ?",
                 (group_id,),
             ).fetchone()
             return dict(row) if row else None
+
+    def set_group_auto_summary_enabled(self, group_id: str, enabled: bool) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT group_id FROM groups WHERE group_id = ?",
+                (group_id,),
+            ).fetchone()
+            if existing is None:
+                return None
+
+            conn.execute(
+                "UPDATE groups SET auto_summary_enabled = ? WHERE group_id = ?",
+                (1 if enabled else 0, group_id),
+            )
+            row = conn.execute(
+                "SELECT group_id, group_name, auto_summary_enabled, updated_at FROM groups WHERE group_id = ?",
+                (group_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def is_group_auto_summary_enabled(self, group_id: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT auto_summary_enabled FROM groups WHERE group_id = ?",
+                (group_id,),
+            ).fetchone()
+            return bool(row and row["auto_summary_enabled"])
 
     def get_message(self, message_id: str) -> Message | None:
         with self.connect() as conn:
@@ -277,6 +312,45 @@ class Store:
                     ),
                 ).fetchall()
             return [dict(row) for row in rows]
+
+    def count_unread_message_records(self, group_id: str) -> int:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                SELECT last_message_id, last_timestamp
+                FROM summary_cursors
+                WHERE group_id = ?
+                """,
+                (group_id,),
+            ).fetchone()
+            if cursor is None or cursor["last_timestamp"] is None:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM messages
+                    WHERE group_id = ?
+                    """,
+                    (group_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM messages
+                    WHERE group_id = ?
+                      AND (
+                        timestamp > ?
+                        OR (timestamp = ? AND message_id > ?)
+                      )
+                    """,
+                    (
+                        group_id,
+                        cursor["last_timestamp"],
+                        cursor["last_timestamp"],
+                        cursor["last_message_id"] or "",
+                    ),
+                ).fetchone()
+            return int(row["count"] or 0)
 
     def list_recent_messages(self, group_id: str, limit: int = 50) -> list[Message]:
         with self.connect() as conn:

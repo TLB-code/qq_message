@@ -28,9 +28,14 @@ Copy `.env.example` to `.env` or set environment variables directly:
 $env:DEEPSEEK_API_KEY="sk-your-deepseek-api-key"
 $env:DEEPSEEK_MODEL="deepseek-v4-flash"
 $env:DEEPSEEK_BASE_URL="https://api.deepseek.com"
+$env:QQ_SUMMARY_WEBHOOK_TOKEN="use-a-long-random-token"
+$env:QQ_SUMMARY_WEB_PASSWORD="use-a-strong-page-password"
+$env:QQ_SUMMARY_AUTO_SUMMARY_ENABLED="true"
+$env:QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD="500"
 ```
 
 DeepSeek's current OpenAI-compatible base URL is `https://api.deepseek.com`.
+When automatic summaries are enabled globally, you still choose which groups can use it from the web UI. Only selected groups are summarized in 500-message batches as soon as their unread message count reaches the threshold. This runs in the Python service and does not require the web page to be open.
 
 ## Run
 
@@ -66,10 +71,11 @@ data/qq_summary.sqlite3
 Configure NapCat's HTTP POST event reporting URL to:
 
 ```text
-http://127.0.0.1:8000/webhook/onebot
+http://127.0.0.1:8000/webhook/onebot?token=use-a-long-random-token
 ```
 
 When group messages arrive, groups will appear in the web UI automatically.
+If `QQ_SUMMARY_WEBHOOK_TOKEN` is not set, the token check is disabled. Set it before exposing the webhook outside localhost. If `QQ_SUMMARY_WEB_PASSWORD` is set, the web page and data APIs require login.
 
 ## Manual test event
 

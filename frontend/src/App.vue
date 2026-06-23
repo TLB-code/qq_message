@@ -1,5 +1,37 @@
 <template>
+  <main v-if="auth.checked && auth.required && !auth.authenticated" class="login-shell">
+    <form class="login-panel" @submit.prevent="loginToApp">
+      <div class="brand-mark login-mark">
+        <ShieldCheck :size="24" stroke-width="2" />
+      </div>
+      <div>
+        <p class="eyebrow">QQ 群消息总结</p>
+        <h1>输入访问密码</h1>
+        <p>登录后才能查看群消息、总结历史和本地记录。</p>
+      </div>
+      <label class="login-field">
+        <span>密码</span>
+        <input v-model="auth.password" type="password" autocomplete="current-password" autofocus />
+      </label>
+      <button class="primary-button" type="submit" :disabled="auth.isLoading || !auth.password">
+        <ShieldCheck :size="17" />
+        <span>{{ auth.isLoading ? "正在登录" : "登录" }}</span>
+      </button>
+      <p v-if="auth.error" class="login-error">{{ auth.error }}</p>
+    </form>
+  </main>
+
+  <main v-else-if="!auth.checked" class="login-shell">
+    <div class="login-panel">
+      <div class="brand-mark login-mark">
+        <ShieldCheck :size="24" stroke-width="2" />
+      </div>
+      <p>正在检查登录状态...</p>
+    </div>
+  </main>
+
   <main
+    v-else
     class="app-shell"
     :class="{
       'sidebar-is-collapsed': layout.sidebarCollapsed,
@@ -36,6 +68,16 @@
           <button type="button" :disabled="!canMutateUnread" @click="markSelectedGroupRead">
             <CheckCheck :size="17" />
             <span>标记已读</span>
+          </button>
+          <button
+            class="auto-summary-toggle"
+            type="button"
+            :class="{ active: selectedGroupAutoSummaryEnabled }"
+            :disabled="!selectedGroupId || isMutating"
+            @click="toggleSelectedGroupAutoSummary"
+          >
+            <Bot :size="17" />
+            <span>{{ selectedGroupAutoSummaryEnabled ? "自动总结已开" : "开启自动总结" }}</span>
           </button>
         </div>
       </header>
@@ -194,6 +236,7 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
 import {
   Archive,
+  Bot,
   CheckCheck,
   ChevronLeft,
   ChevronRight,
@@ -202,6 +245,7 @@ import {
   Inbox,
   Info,
   ScrollText,
+  ShieldCheck,
   Sparkles,
 } from "@lucide/vue";
 import GroupSidebar from "./components/GroupSidebar.vue";
@@ -210,12 +254,15 @@ import SummaryPanel from "./components/SummaryPanel.vue";
 import UnreadPanel from "./components/UnreadPanel.vue";
 import {
   deleteHistoryDay,
+  getAuthStatus,
   getGroupDetail,
   getHistory,
   getSummaries,
   listGroups,
+  login,
   markGroupRead,
   markSummaryRead,
+  setGroupAutoSummary,
   summarizeGroup,
 } from "./services/api";
 import { formatFullTime } from "./utils/format";
@@ -240,6 +287,14 @@ const isMutating = ref(false);
 const historyPanel = ref(null);
 const panelGrid = ref(null);
 const status = reactive({ message: "", type: "" });
+const auth = reactive({
+  checked: false,
+  required: false,
+  authenticated: false,
+  password: "",
+  isLoading: false,
+  error: "",
+});
 const history = reactive({
   groupId: null,
   messages: [],
@@ -298,6 +353,9 @@ const historyTotalCount = computed(() => {
   if (history.loadedDate) return history.totalCount;
   return selectedGroupStats.value.messageCount || history.totalCount;
 });
+const selectedGroupAutoSummaryEnabled = computed(() =>
+  Boolean(selectedGroup.value?.group?.auto_summary_enabled),
+);
 const canMutateUnread = computed(() => Boolean(selectedGroupId.value && unreadMessages.value.length && !isMutating.value));
 const canSummarize = computed(() => canMutateUnread.value);
 const hasCollapsedPanels = computed(() => PANEL_IDS.some((id) => layout.collapsedPanels[id]));
@@ -321,6 +379,37 @@ function panelColumn(panelId) {
 function setStatus(message, type = "") {
   status.message = message;
   status.type = type;
+}
+
+async function checkAuth() {
+  try {
+    const result = await getAuthStatus();
+    auth.required = Boolean(result.auth_required);
+    auth.authenticated = Boolean(result.authenticated);
+    auth.error = "";
+  } catch (error) {
+    auth.required = true;
+    auth.authenticated = false;
+    auth.error = error.message;
+  } finally {
+    auth.checked = true;
+  }
+}
+
+async function loginToApp() {
+  if (!auth.password || auth.isLoading) return;
+  auth.isLoading = true;
+  auth.error = "";
+  try {
+    await login(auth.password);
+    auth.password = "";
+    auth.authenticated = true;
+    await refreshCurrentView({ force: true });
+  } catch (error) {
+    auth.error = error.status === 401 ? "密码不正确" : error.message;
+  } finally {
+    auth.isLoading = false;
+  }
 }
 
 function toggleSidebar() {
@@ -410,16 +499,34 @@ function resetSummaryState(groupId) {
 }
 
 async function loadGroups() {
-  const data = await listGroups();
-  groups.value = data.groups || [];
+  try {
+    const data = await listGroups();
+    groups.value = data.groups || [];
+  } catch (error) {
+    handleAuthError(error);
+    throw error;
+  }
 }
 
 async function loadSelectedGroupDetail(groupId = selectedGroupId.value) {
   if (!groupId) return;
-  const detail = await getGroupDetail(groupId, 500);
+  let detail;
+  try {
+    detail = await getGroupDetail(groupId, 500);
+  } catch (error) {
+    handleAuthError(error);
+    throw error;
+  }
   if (selectedGroupId.value === groupId) {
     selectedGroup.value = detail;
   }
+}
+
+function handleAuthError(error) {
+  if (error?.status !== 401) return;
+  auth.required = true;
+  auth.authenticated = false;
+  auth.password = "";
 }
 
 async function loadHistoryMessages({ reset = false, date = history.date, preserve = false } = {}) {
@@ -540,6 +647,7 @@ async function selectGroup(groupId) {
 }
 
 async function refreshCurrentView({ silent = false, force = false } = {}) {
+  if (!auth.checked || !auth.authenticated) return;
   if (isRefreshing.value || isMutating.value || (!force && document.hidden)) return;
   isRefreshing.value = true;
 
@@ -560,6 +668,7 @@ async function refreshCurrentView({ silent = false, force = false } = {}) {
       await appendNewHistoryMessagesIfAtBottom();
     }
   } catch (error) {
+    handleAuthError(error);
     if (!silent) setStatus(error.message, "error");
   } finally {
     isRefreshing.value = false;
@@ -579,6 +688,7 @@ async function summarizeSelectedGroup() {
     await loadHistoryMessages({ reset: true, date: history.date });
     setStatus("总结完成。", "success");
   } catch (error) {
+    handleAuthError(error);
     setStatus(error.message, "error");
   } finally {
     isMutating.value = false;
@@ -596,6 +706,33 @@ async function markSelectedGroupRead() {
     await loadSelectedGroupDetail(selectedGroupId.value);
     setStatus("已标记为已读。", "success");
   } catch (error) {
+    handleAuthError(error);
+    setStatus(error.message, "error");
+  } finally {
+    isMutating.value = false;
+  }
+}
+
+async function toggleSelectedGroupAutoSummary() {
+  if (!selectedGroupId.value) return;
+  const enabled = !selectedGroupAutoSummaryEnabled.value;
+  isMutating.value = true;
+  setStatus(enabled ? "正在开启该群自动总结..." : "正在关闭该群自动总结...");
+
+  try {
+    const result = await setGroupAutoSummary(selectedGroupId.value, enabled);
+    await loadGroups();
+    if (selectedGroup.value?.group && result.group) {
+      selectedGroup.value = {
+        ...selectedGroup.value,
+        group: result.group,
+      };
+    } else {
+      await loadSelectedGroupDetail(selectedGroupId.value);
+    }
+    setStatus(enabled ? "该群已开启自动总结。" : "该群已关闭自动总结。", "success");
+  } catch (error) {
+    handleAuthError(error);
     setStatus(error.message, "error");
   } finally {
     isMutating.value = false;
@@ -606,6 +743,7 @@ async function loadMoreHistory() {
   try {
     await loadHistoryMessages({ preserve: true });
   } catch (error) {
+    handleAuthError(error);
     setStatus(error.message, "error");
   }
 }
@@ -614,6 +752,7 @@ async function loadMoreSummaries() {
   try {
     await loadSummaryHistory();
   } catch (error) {
+    handleAuthError(error);
     setStatus(error.message, "error");
   }
 }
@@ -632,6 +771,7 @@ async function markSummaryAsRead(summaryId) {
     );
     setStatus("总结已标记为已读。", "success");
   } catch (error) {
+    handleAuthError(error);
     setStatus(error.message, "error");
   } finally {
     markingSummaryReadIds.value = markingSummaryReadIds.value.filter((id) => id !== summaryId);
@@ -644,6 +784,7 @@ async function loadSelectedHistoryDate() {
     await loadHistoryMessages({ reset: true, date: history.date });
     setStatus("");
   } catch (error) {
+    handleAuthError(error);
     setStatus(error.message, "error");
   }
 }
@@ -654,6 +795,7 @@ async function clearHistoryDate() {
     await loadHistoryMessages({ reset: true, date: "" });
     setStatus("");
   } catch (error) {
+    handleAuthError(error);
     setStatus(error.message, "error");
   }
 }
@@ -671,6 +813,7 @@ async function deleteSelectedHistoryDay() {
     await loadHistoryMessages({ reset: true, date: history.date });
     setStatus(`已删除 ${history.date} 的 ${result.deleted_count || 0} 条本地历史消息。`, "success");
   } catch (error) {
+    handleAuthError(error);
     setStatus(error.message, "error");
   } finally {
     isMutating.value = false;
@@ -678,7 +821,11 @@ async function deleteSelectedHistoryDay() {
 }
 
 onMounted(() => {
-  refreshCurrentView({ force: true });
+  checkAuth().then(() => {
+    if (auth.authenticated) {
+      refreshCurrentView({ force: true });
+    }
+  });
   refreshTimer = window.setInterval(() => refreshCurrentView({ silent: true }), AUTO_REFRESH_INTERVAL_MS);
   document.addEventListener("visibilitychange", handleVisibilityChange);
 });
@@ -690,7 +837,7 @@ onUnmounted(() => {
 });
 
 function handleVisibilityChange() {
-  if (!document.hidden) {
+  if (!document.hidden && auth.authenticated) {
     refreshCurrentView({ silent: true, force: true });
   }
 }
