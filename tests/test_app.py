@@ -275,6 +275,67 @@ class AppTests(unittest.TestCase):
             ])
             self.assertEqual([row["summary"] for row in second_page], ["summary 1", "summary 0"])
 
+    def test_store_marks_summary_read(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "test.sqlite3")
+            store.init()
+            store.upsert_group("1", "test group", 100)
+            message = Message("1", "1", "u1", "user", "message", 100)
+            store.save_message(message, {"message_id": "1"})
+            summary_id = store.save_summary("1", [message], "summary", "test-model", 101, mark_read=False)
+
+            before = store.list_summaries("1", limit=1)[0]
+            updated = store.mark_summary_read("1", summary_id)
+            after = store.list_summaries("1", limit=1)[0]
+
+            self.assertEqual(before["is_read"], 0)
+            self.assertEqual(updated["is_read"], 1)
+            self.assertEqual(after["is_read"], 1)
+
+    def test_store_migrates_summary_read_column(self):
+        with TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "test.sqlite3"
+            store = Store(database_path)
+            with store.connect() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE summaries (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        group_id TEXT NOT NULL,
+                        from_message_id TEXT,
+                        to_message_id TEXT,
+                        from_timestamp INTEGER,
+                        to_timestamp INTEGER,
+                        message_count INTEGER NOT NULL,
+                        model TEXT NOT NULL,
+                        summary TEXT NOT NULL,
+                        created_at INTEGER NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO summaries (
+                        group_id,
+                        from_message_id,
+                        to_message_id,
+                        from_timestamp,
+                        to_timestamp,
+                        message_count,
+                        model,
+                        summary,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("1", "1", "1", 100, 100, 1, "test-model", "summary", 101),
+                )
+
+            store.init()
+            row = store.list_summaries("1", limit=1)[0]
+
+            self.assertEqual(row["is_read"], 0)
+
     def test_compact_messages_keeps_content_under_limit(self):
         messages = [
             Message(str(i), "1", "u", "群友", f"消息 {i} " + "x" * 50, 1718000000 + i)

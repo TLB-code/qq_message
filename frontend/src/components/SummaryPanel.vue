@@ -15,7 +15,21 @@
             <h3>{{ index === 0 ? "最新总结" : `历史总结 #${summary.id}` }}</h3>
             <p>{{ formatFullTime(summary.created_at) }} · {{ summary.model }}</p>
           </div>
-          <span>{{ summary.message_count || 0 }} 条</span>
+          <div class="summary-card-actions">
+            <span>{{ summary.message_count || 0 }} 条</span>
+            <button
+              class="summary-read-button"
+              type="button"
+              :class="{ read: summary.is_read }"
+              :disabled="Boolean(summary.is_read) || markingReadIds.includes(summary.id)"
+              @click="$emit('mark-read', summary.id)"
+            >
+              <Check v-if="summary.is_read" :size="14" />
+              <LoaderCircle v-else-if="markingReadIds.includes(summary.id)" :size="14" class="spinning" />
+              <Circle v-else :size="14" />
+              <span>{{ summary.is_read ? "已读" : "标记已读" }}</span>
+            </button>
+          </div>
         </header>
         <SummaryMarkdown :markdown="summary.summary" />
       </article>
@@ -35,7 +49,7 @@
 </template>
 
 <script setup>
-import { LoaderCircle, ScrollText } from "@lucide/vue";
+import { Check, Circle, LoaderCircle, ScrollText } from "@lucide/vue";
 import EmptyState from "./EmptyState.vue";
 import SummaryMarkdown from "./SummaryMarkdown.vue";
 import { formatFullTime } from "../utils/format";
@@ -53,9 +67,13 @@ defineProps({
     type: Boolean,
     default: false,
   },
+  markingReadIds: {
+    type: Array,
+    default: () => [],
+  },
 });
 
-const emit = defineEmits(["load-more"]);
+const emit = defineEmits(["load-more", "mark-read"]);
 
 function handleScroll(event) {
   const target = event.currentTarget;

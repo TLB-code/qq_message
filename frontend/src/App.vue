@@ -1,11 +1,19 @@
 <template>
-  <main class="app-shell">
+  <main
+    class="app-shell"
+    :class="{
+      'sidebar-is-collapsed': layout.sidebarCollapsed,
+      'is-resizing-layout': resizeState.active,
+    }"
+  >
     <GroupSidebar
       :groups="groups"
       :selected-group-id="selectedGroupId"
       :loading="isRefreshing"
+      :collapsed="layout.sidebarCollapsed"
       @refresh="refreshCurrentView({ force: true })"
       @select="selectGroup"
+      @toggle="toggleSidebar"
     />
 
     <section class="workspace">
@@ -53,29 +61,127 @@
         </div>
         <div>
           <span>自动刷新</span>
-          <strong>5 秒</strong>
+          <strong>1 秒</strong>
         </div>
       </section>
 
-      <div class="content-grid">
-        <UnreadPanel :unread="unreadMessages" />
-        <SummaryPanel
-          :summaries="summaries"
-          :has-more="summaryHistory.hasMore"
-          :loading="summaryHistory.isLoading"
-          @load-more="loadMoreSummaries"
-        />
-        <HistoryPanel
-          ref="historyPanel"
-          v-model:date="history.date"
-          :messages="history.messages"
-          :has-more="history.hasMore"
-          :loading="history.isLoading"
-          @load-more="loadMoreHistory"
-          @load-date="loadSelectedHistoryDate"
-          @clear-date="clearHistoryDate"
-          @delete-date="deleteSelectedHistoryDay"
-        />
+      <div
+        ref="panelGrid"
+        class="content-grid"
+        :class="{ 'has-collapsed-panels': hasCollapsedPanels }"
+        :style="contentGridStyle"
+      >
+        <div
+          class="panel-frame"
+          :class="{ collapsed: isPanelCollapsed('unread') }"
+          data-panel="unread"
+        >
+          <button
+            v-if="isPanelCollapsed('unread')"
+            class="panel-rail"
+            type="button"
+            title="展开未读消息"
+            @click="togglePanel('unread')"
+          >
+            <Inbox :size="18" />
+            <span>未读</span>
+            <strong>{{ unreadMessages.length }}</strong>
+            <ChevronRight :size="14" />
+          </button>
+          <template v-else>
+            <button class="panel-collapse-button" type="button" title="收起未读消息" @click="togglePanel('unread')">
+              <ChevronLeft :size="15" />
+            </button>
+            <UnreadPanel :unread="unreadMessages" />
+          </template>
+        </div>
+
+        <button
+          class="panel-resizer"
+          type="button"
+          aria-label="调整未读消息和总结历史宽度"
+          :disabled="!canResizePanels('unread', 'summary')"
+          @pointerdown="startPanelResize('unread', 'summary', $event)"
+        >
+          <GripVertical :size="15" />
+        </button>
+
+        <div
+          class="panel-frame"
+          :class="{ collapsed: isPanelCollapsed('summary') }"
+          data-panel="summary"
+        >
+          <button
+            v-if="isPanelCollapsed('summary')"
+            class="panel-rail"
+            type="button"
+            title="展开总结历史"
+            @click="togglePanel('summary')"
+          >
+            <ScrollText :size="18" />
+            <span>总结</span>
+            <strong>{{ summaries.length }}</strong>
+            <ChevronRight :size="14" />
+          </button>
+          <template v-else>
+            <button class="panel-collapse-button" type="button" title="收起总结历史" @click="togglePanel('summary')">
+              <ChevronLeft :size="15" />
+            </button>
+            <SummaryPanel
+              :summaries="summaries"
+              :has-more="summaryHistory.hasMore"
+              :loading="summaryHistory.isLoading"
+              :marking-read-ids="markingSummaryReadIds"
+              @load-more="loadMoreSummaries"
+              @mark-read="markSummaryAsRead"
+            />
+          </template>
+        </div>
+
+        <button
+          class="panel-resizer"
+          type="button"
+          aria-label="调整总结历史和历史消息宽度"
+          :disabled="!canResizePanels('summary', 'history')"
+          @pointerdown="startPanelResize('summary', 'history', $event)"
+        >
+          <GripVertical :size="15" />
+        </button>
+
+        <div
+          class="panel-frame"
+          :class="{ collapsed: isPanelCollapsed('history') }"
+          data-panel="history"
+        >
+          <button
+            v-if="isPanelCollapsed('history')"
+            class="panel-rail"
+            type="button"
+            title="展开历史消息"
+            @click="togglePanel('history')"
+          >
+            <Archive :size="18" />
+            <span>历史</span>
+            <strong>{{ history.messages.length }}</strong>
+            <ChevronRight :size="14" />
+          </button>
+          <template v-else>
+            <button class="panel-collapse-button" type="button" title="收起历史消息" @click="togglePanel('history')">
+              <ChevronLeft :size="15" />
+            </button>
+            <HistoryPanel
+              ref="historyPanel"
+              v-model:date="history.date"
+              :messages="history.messages"
+              :has-more="history.hasMore"
+              :loading="history.isLoading"
+              @load-more="loadMoreHistory"
+              @load-date="loadSelectedHistoryDate"
+              @clear-date="clearHistoryDate"
+              @delete-date="deleteSelectedHistoryDay"
+            />
+          </template>
+        </div>
       </div>
     </section>
   </main>
@@ -83,7 +189,18 @@
 
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
-import { CheckCheck, CircleAlert, Info, Sparkles } from "@lucide/vue";
+import {
+  Archive,
+  CheckCheck,
+  ChevronLeft,
+  ChevronRight,
+  CircleAlert,
+  GripVertical,
+  Inbox,
+  Info,
+  ScrollText,
+  Sparkles,
+} from "@lucide/vue";
 import GroupSidebar from "./components/GroupSidebar.vue";
 import HistoryPanel from "./components/HistoryPanel.vue";
 import SummaryPanel from "./components/SummaryPanel.vue";
@@ -95,20 +212,30 @@ import {
   getSummaries,
   listGroups,
   markGroupRead,
+  markSummaryRead,
   summarizeGroup,
 } from "./services/api";
 import { formatFullTime } from "./utils/format";
 
-const AUTO_REFRESH_INTERVAL_MS = 5000;
+const AUTO_REFRESH_INTERVAL_MS = 1000;
 const HISTORY_PAGE_SIZE = 50;
 const SUMMARY_PAGE_SIZE = 5;
+const PANEL_IDS = ["unread", "summary", "history"];
+const PANEL_MIN_WEIGHT = 0.5;
+const PANEL_MIN_WIDTHS = {
+  unread: 260,
+  summary: 300,
+  history: 300,
+};
 
 const groups = ref([]);
 const selectedGroupId = ref(null);
 const selectedGroup = ref(null);
+const markingSummaryReadIds = ref([]);
 const isRefreshing = ref(false);
 const isMutating = ref(false);
 const historyPanel = ref(null);
+const panelGrid = ref(null);
 const status = reactive({ message: "", type: "" });
 const history = reactive({
   groupId: null,
@@ -127,6 +254,28 @@ const summaryHistory = reactive({
   isLoading: false,
   initialized: false,
 });
+const layout = reactive({
+  sidebarCollapsed: false,
+  collapsedPanels: {
+    unread: false,
+    summary: false,
+    history: false,
+  },
+  panelWeights: {
+    unread: 0.95,
+    summary: 1.15,
+    history: 1,
+  },
+});
+const resizeState = reactive({
+  active: false,
+  leftId: "",
+  rightId: "",
+  startX: 0,
+  startLeftWeight: 0,
+  startRightWeight: 0,
+  pairWidth: 1,
+});
 
 let refreshTimer = null;
 
@@ -140,10 +289,91 @@ const selectedGroupStats = computed(() => {
 });
 const canMutateUnread = computed(() => Boolean(selectedGroupId.value && unreadMessages.value.length && !isMutating.value));
 const canSummarize = computed(() => canMutateUnread.value);
+const hasCollapsedPanels = computed(() => PANEL_IDS.some((id) => layout.collapsedPanels[id]));
+const contentGridStyle = computed(() => ({
+  gridTemplateColumns: [
+    panelColumn("unread"),
+    "10px",
+    panelColumn("summary"),
+    "10px",
+    panelColumn("history"),
+  ].join(" "),
+}));
+
+function panelColumn(panelId) {
+  if (layout.collapsedPanels[panelId]) {
+    return "54px";
+  }
+  return `minmax(${PANEL_MIN_WIDTHS[panelId]}px, ${layout.panelWeights[panelId]}fr)`;
+}
 
 function setStatus(message, type = "") {
   status.message = message;
   status.type = type;
+}
+
+function toggleSidebar() {
+  layout.sidebarCollapsed = !layout.sidebarCollapsed;
+}
+
+function isPanelCollapsed(panelId) {
+  return Boolean(layout.collapsedPanels[panelId]);
+}
+
+function togglePanel(panelId) {
+  layout.collapsedPanels[panelId] = !layout.collapsedPanels[panelId];
+  if (panelId === "history" && !layout.collapsedPanels[panelId]) {
+    nextTick(() => historyPanel.value?.scrollToBottom());
+  }
+}
+
+function canResizePanels(leftId, rightId) {
+  return !layout.collapsedPanels[leftId] && !layout.collapsedPanels[rightId];
+}
+
+function startPanelResize(leftId, rightId, event) {
+  if (!canResizePanels(leftId, rightId) || event.button !== 0) return;
+  const leftElement = panelGrid.value?.querySelector(`[data-panel="${leftId}"]`);
+  const rightElement = panelGrid.value?.querySelector(`[data-panel="${rightId}"]`);
+  if (!leftElement || !rightElement) return;
+
+  event.preventDefault();
+  resizeState.active = true;
+  resizeState.leftId = leftId;
+  resizeState.rightId = rightId;
+  resizeState.startX = event.clientX;
+  resizeState.startLeftWeight = layout.panelWeights[leftId];
+  resizeState.startRightWeight = layout.panelWeights[rightId];
+  resizeState.pairWidth = Math.max(
+    leftElement.getBoundingClientRect().width + rightElement.getBoundingClientRect().width,
+    1,
+  );
+  window.addEventListener("pointermove", handlePanelResize);
+  window.addEventListener("pointerup", stopPanelResize);
+}
+
+function handlePanelResize(event) {
+  if (!resizeState.active) return;
+  const totalWeight = resizeState.startLeftWeight + resizeState.startRightWeight;
+  const deltaWeight = (event.clientX - resizeState.startX) / resizeState.pairWidth * totalWeight;
+  const nextLeft = clamp(
+    resizeState.startLeftWeight + deltaWeight,
+    PANEL_MIN_WEIGHT,
+    totalWeight - PANEL_MIN_WEIGHT,
+  );
+  layout.panelWeights[resizeState.leftId] = Number(nextLeft.toFixed(3));
+  layout.panelWeights[resizeState.rightId] = Number((totalWeight - nextLeft).toFixed(3));
+}
+
+function stopPanelResize() {
+  if (!resizeState.active) return;
+  resizeState.active = false;
+  window.removeEventListener("pointermove", handlePanelResize);
+  window.removeEventListener("pointerup", stopPanelResize);
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
 }
 
 function resetHistoryState(groupId, date = "") {
@@ -371,6 +601,26 @@ async function loadMoreSummaries() {
   }
 }
 
+async function markSummaryAsRead(summaryId) {
+  if (!selectedGroupId.value || markingSummaryReadIds.value.includes(summaryId)) return;
+
+  markingSummaryReadIds.value = [...markingSummaryReadIds.value, summaryId];
+  try {
+    const result = await markSummaryRead(selectedGroupId.value, summaryId);
+    const updated = result.summary;
+    if (!updated) return;
+
+    summaryHistory.summaries = summaryHistory.summaries.map((summary) =>
+      summary.id === updated.id ? { ...summary, ...updated } : summary,
+    );
+    setStatus("总结已标记为已读。", "success");
+  } catch (error) {
+    setStatus(error.message, "error");
+  } finally {
+    markingSummaryReadIds.value = markingSummaryReadIds.value.filter((id) => id !== summaryId);
+  }
+}
+
 async function loadSelectedHistoryDate() {
   if (!selectedGroupId.value || !history.date) return;
   try {
@@ -419,6 +669,7 @@ onMounted(() => {
 onUnmounted(() => {
   if (refreshTimer) window.clearInterval(refreshTimer);
   document.removeEventListener("visibilitychange", handleVisibilityChange);
+  stopPanelResize();
 });
 
 function handleVisibilityChange() {

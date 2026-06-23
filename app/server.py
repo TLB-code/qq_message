@@ -413,7 +413,15 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _handle_group_post(self, path: str) -> None:
         parts = path.strip("/").split("/")
-        if len(parts) != 4 or parts[0] != "api" or parts[1] != "groups":
+        if parts[0:2] != ["api", "groups"]:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+            return
+
+        if len(parts) == 6 and parts[3] == "summaries" and parts[5] == "read":
+            self._mark_summary_read(parts[2], parts[4])
+            return
+
+        if len(parts) != 4:
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
             return
 
@@ -430,6 +438,25 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK, {"ok": True, **result})
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+
+    def _mark_summary_read(self, group_id: str, summary_id_text: str) -> None:
+        group = STORE.get_group(group_id)
+        if not group:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Group not found"})
+            return
+
+        try:
+            summary_id = int(summary_id_text)
+        except (TypeError, ValueError):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "Invalid summary id"})
+            return
+
+        summary = STORE.mark_summary_read(group_id, summary_id)
+        if summary is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Summary not found"})
+            return
+
+        self._json(HTTPStatus.OK, {"ok": True, "group": group, "summary": summary})
 
     def _summarize_group(self, group_id: str) -> None:
         group = STORE.get_group(group_id)

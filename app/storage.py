@@ -75,11 +75,18 @@ class Store:
                     message_count INTEGER NOT NULL,
                     model TEXT NOT NULL,
                     summary TEXT NOT NULL,
+                    is_read INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL,
                     FOREIGN KEY (group_id) REFERENCES groups(group_id)
                 );
                 """
             )
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(summaries)").fetchall()
+            }
+            if "is_read" not in columns:
+                conn.execute("ALTER TABLE summaries ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0")
 
     def upsert_group(self, group_id: str, group_name: str, updated_at: int) -> None:
         with self.connect() as conn:
@@ -452,7 +459,7 @@ class Store:
             rows = conn.execute(
                 f"""
                 SELECT id, group_id, from_message_id, to_message_id, from_timestamp,
-                       to_timestamp, message_count, model, summary, created_at
+                       to_timestamp, message_count, model, summary, is_read, created_at
                 FROM summaries
                 WHERE {" AND ".join(filters)}
                 ORDER BY id DESC
@@ -461,6 +468,34 @@ class Store:
                 (*params, limit),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def mark_summary_read(self, group_id: str, summary_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            existing = conn.execute(
+                """
+                SELECT id
+                FROM summaries
+                WHERE group_id = ? AND id = ?
+                """,
+                (group_id, summary_id),
+            ).fetchone()
+            if existing is None:
+                return None
+
+            conn.execute(
+                "UPDATE summaries SET is_read = 1 WHERE group_id = ? AND id = ?",
+                (group_id, summary_id),
+            )
+            row = conn.execute(
+                """
+                SELECT id, group_id, from_message_id, to_message_id, from_timestamp,
+                       to_timestamp, message_count, model, summary, is_read, created_at
+                FROM summaries
+                WHERE group_id = ? AND id = ?
+                """,
+                (group_id, summary_id),
+            ).fetchone()
+            return dict(row) if row else None
 
     def mark_read(self, group_id: str, now: int) -> dict[str, Any]:
         messages = self.list_recent_messages(group_id, limit=1)

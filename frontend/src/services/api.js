@@ -30,6 +30,16 @@ export function getSummaries(groupId, { cursor = null, limit = 5 } = {}) {
   return requestJson(`/api/groups/${encodeURIComponent(groupId)}/summaries?${params.toString()}`);
 }
 
+export function markSummaryRead(groupId, summaryId) {
+  return requestJson(
+    `/api/groups/${encodeURIComponent(groupId)}/summaries/${encodeURIComponent(summaryId)}/read`,
+    {
+      method: "POST",
+      body: JSON.stringify({}),
+    },
+  );
+}
+
 export function summarizeGroup(groupId, limit = 500) {
   return requestJson(`/api/groups/${encodeURIComponent(groupId)}/summarize`, {
     method: "POST",

@@ -91,6 +91,17 @@ button:disabled {
   display: grid;
   grid-template-columns: 304px minmax(0, 1fr);
   min-height: 100vh;
+  transition: grid-template-columns 0.18s ease;
+}
+
+.app-shell.sidebar-is-collapsed {
+  grid-template-columns: 68px minmax(0, 1fr);
+}
+
+.app-shell.is-resizing-layout,
+.app-shell.is-resizing-layout * {
+  cursor: col-resize !important;
+  user-select: none;
 }
 
 .sidebar {
@@ -103,6 +114,38 @@ button:disabled {
   background: var(--sidebar);
   color: #eef6ff;
   padding: 20px;
+  transition:
+    padding 0.18s ease,
+    width 0.18s ease;
+}
+
+.sidebar.collapsed {
+  align-items: center;
+  padding: 14px 8px;
+  overflow: hidden;
+}
+
+.sidebar-rail {
+  display: grid;
+  width: 48px;
+  min-height: 128px;
+  justify-items: center;
+  align-content: center;
+  gap: 9px;
+  border-color: rgb(255 255 255 / 14%);
+  background: var(--sidebar-soft);
+  color: #eaf7ff;
+  padding: 10px 0;
+  writing-mode: vertical-rl;
+}
+
+.sidebar-rail svg {
+  writing-mode: horizontal-tb;
+}
+
+.sidebar-rail:hover:not(:disabled) {
+  border-color: #58d8ca;
+  color: #ffffff;
 }
 
 .brand {
@@ -110,6 +153,26 @@ button:disabled {
   align-items: center;
   gap: 12px;
   min-height: 48px;
+}
+
+.brand > div:nth-child(2) {
+  min-width: 0;
+  flex: 1;
+}
+
+.sidebar-toggle {
+  flex: 0 0 auto;
+  width: 34px;
+  min-height: 34px;
+  border-color: rgb(255 255 255 / 12%);
+  background: rgb(255 255 255 / 6%);
+  color: #dcecff;
+  padding: 0;
+}
+
+.sidebar-toggle:hover:not(:disabled) {
+  border-color: #58d8ca;
+  color: #ffffff;
 }
 
 .brand-mark {
@@ -349,12 +412,103 @@ button:disabled {
 
 .content-grid {
   display: grid;
-  grid-template-columns:
-    minmax(300px, 0.95fr)
-    minmax(380px, 1.15fr)
-    minmax(340px, 1fr);
-  gap: 16px;
+  gap: 0;
   align-items: start;
+  min-height: calc(100vh - 148px);
+}
+
+.panel-frame {
+  position: relative;
+  min-width: 0;
+  padding: 0 8px;
+  transition: opacity 0.15s ease;
+}
+
+.panel-frame:first-child {
+  padding-left: 0;
+}
+
+.panel-frame:last-child {
+  padding-right: 0;
+}
+
+.panel-frame.collapsed {
+  align-self: stretch;
+  padding: 0 5px;
+}
+
+.panel-frame.collapsed + .panel-resizer,
+.panel-resizer:disabled {
+  opacity: 0.22;
+  cursor: default;
+  pointer-events: none;
+}
+
+.panel-rail {
+  position: sticky;
+  top: 22px;
+  display: grid;
+  width: 44px;
+  min-height: calc(100vh - 170px);
+  justify-items: center;
+  align-content: start;
+  gap: 10px;
+  border-color: var(--line);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  padding: 14px 0;
+  color: var(--muted-strong);
+  writing-mode: vertical-rl;
+}
+
+.panel-rail svg,
+.panel-rail strong {
+  writing-mode: horizontal-tb;
+}
+
+.panel-rail strong {
+  display: grid;
+  min-width: 24px;
+  min-height: 24px;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: 12px;
+}
+
+.panel-collapse-button {
+  position: absolute;
+  z-index: 3;
+  top: 12px;
+  right: 18px;
+  width: 30px;
+  min-height: 30px;
+  border-radius: 999px;
+  background: #ffffffd9;
+  box-shadow: 0 4px 16px rgb(15 23 42 / 10%);
+  padding: 0;
+}
+
+.panel-frame:last-child .panel-collapse-button {
+  right: 10px;
+}
+
+.panel-resizer {
+  align-self: stretch;
+  width: 10px;
+  min-height: calc(100vh - 238px);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--line-strong);
+  cursor: col-resize;
+  padding: 0;
+}
+
+.panel-resizer:hover:not(:disabled) {
+  background: linear-gradient(90deg, transparent, var(--accent-soft), transparent);
+  color: var(--accent-strong);
 }
 
 .panel {
@@ -375,6 +529,10 @@ button:disabled {
   border-bottom: 1px solid var(--line);
   background: linear-gradient(180deg, #ffffff 0%, #fbfcfe 100%);
   padding: 14px;
+}
+
+.panel-frame:not(.collapsed) .panel-header {
+  padding-right: 54px;
 }
 
 .panel-header h2,
@@ -614,7 +772,16 @@ button:disabled {
   font-size: 12px;
 }
 
-.summary-card-head > span {
+.summary-card-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.summary-card-actions > span {
   flex: 0 0 auto;
   border-radius: 999px;
   background: var(--accent-soft);
@@ -622,6 +789,26 @@ button:disabled {
   color: var(--accent-strong);
   font-size: 12px;
   font-weight: 800;
+}
+
+.summary-read-button {
+  min-height: 28px;
+  border-color: #cad7e6;
+  border-radius: 999px;
+  padding: 0 9px;
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.summary-read-button.read {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.summary-read-button:disabled {
+  opacity: 1;
 }
 
 .summary-load-marker {
@@ -784,15 +971,16 @@ button:disabled {
 
 @media (max-width: 1320px) {
   .content-grid {
-    grid-template-columns: minmax(320px, 0.9fr) minmax(380px, 1.1fr);
+    overflow-x: auto;
+    padding-bottom: 8px;
   }
 
   .history-panel {
-    grid-column: 1 / -1;
+    grid-column: auto;
   }
 
   .history-scroll {
-    max-height: 520px;
+    max-height: calc(100vh - 238px);
   }
 }
 
@@ -805,6 +993,17 @@ button:disabled {
     position: static;
     height: auto;
     max-height: 420px;
+  }
+
+  .sidebar.collapsed {
+    align-items: stretch;
+    max-height: none;
+  }
+
+  .sidebar-rail {
+    width: 100%;
+    min-height: 52px;
+    writing-mode: horizontal-tb;
   }
 
   .workspace {
@@ -824,7 +1023,36 @@ button:disabled {
   }
 
   .content-grid {
-    grid-template-columns: 1fr;
+    display: grid;
+    grid-template-columns: 1fr !important;
+    gap: 12px;
+    min-height: 0;
+  }
+
+  .panel-frame,
+  .panel-frame:first-child,
+  .panel-frame:last-child {
+    padding: 0;
+  }
+
+  .panel-resizer {
+    display: none;
+  }
+
+  .panel-rail {
+    position: static;
+    width: 100%;
+    min-height: 46px;
+    grid-auto-flow: column;
+    grid-auto-columns: max-content;
+    justify-content: start;
+    align-content: center;
+    padding: 0 12px;
+    writing-mode: horizontal-tb;
+  }
+
+  .panel-collapse-button {
+    right: 12px;
   }
 }
 
