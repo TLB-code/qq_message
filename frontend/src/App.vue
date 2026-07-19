@@ -267,7 +267,7 @@ import {
 } from "./services/api";
 import { formatFullTime } from "./utils/format";
 
-const AUTO_REFRESH_INTERVAL_MS = 1000;
+const AUTO_REFRESH_INTERVAL_MS = 3000;
 const HISTORY_PAGE_SIZE = 50;
 const SUMMARY_PAGE_SIZE = 5;
 const PANEL_IDS = ["unread", "summary", "history"];
@@ -648,7 +648,7 @@ async function selectGroup(groupId) {
 
 async function refreshCurrentView({ silent = false, force = false } = {}) {
   if (!auth.checked || !auth.authenticated) return;
-  if (isRefreshing.value || isMutating.value || (!force && document.hidden)) return;
+  if (isRefreshing.value || isMutating.value || history.isLoading || (!force && document.hidden)) return;
   isRefreshing.value = true;
 
   try {

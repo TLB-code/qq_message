@@ -82,7 +82,7 @@ nginx -v
 cd /opt
 ```
 
-拉取 GitHub 私有仓库：
+拉取 GitHub 公开仓库：
 
 ```bash
 sudo git clone https://github.com/TLB-code/qq_message.git
@@ -90,21 +90,12 @@ sudo chown -R $USER:$USER /opt/qq_message
 cd /opt/qq_message
 ```
 
-如果提示没有权限，说明服务器还没有 GitHub 私有仓库访问权限。可以任选一种方式处理：
+现在仓库已经公开，正常情况下服务器不需要登录 GitHub，也不需要配置 Personal Access Token、SSH Key 或 Deploy Key。
+
+如果服务器提示找不到仓库，优先检查仓库地址是否写对：
 
 ```text
-方式 1：使用 GitHub Personal Access Token 登录 HTTPS
-方式 2：给服务器配置 SSH Key，然后用 git@github.com:TLB-code/qq_message.git 克隆
-方式 3：在 GitHub 仓库里配置 Deploy Key
-```
-
-如果使用 SSH：
-
-```bash
-cd /opt
-sudo git clone git@github.com:TLB-code/qq_message.git
-sudo chown -R $USER:$USER /opt/qq_message
-cd /opt/qq_message
+https://github.com/TLB-code/qq_message.git
 ```
 
 ## 4. 创建 `.env`
@@ -383,11 +374,213 @@ Python 后端必须一直运行
 NapCat 必须一直在线并持续接收 QQ 群消息
 ```
 
+### 服务器安装 NapCat
+
+方案 A 是 NapCat 和后端在同一台服务器上，所以需要先在服务器里安装并登录 NapCat。
+
+这里推荐使用 NapCat 官方 Linux 一键安装脚本的“本地 Shell 安装”，不要优先用 Docker。原因是 Docker 里配置 webhook 时，`127.0.0.1` 默认指向容器自己，容易和后端服务地址混淆；本地 Shell 安装更适合当前这个项目。
+
+官方文档：
+
+```text
+https://napneko.github.io/guide/boot/Shell
+https://github.com/NapNeko/NapCat-Installer
+```
+
+#### 1. 安装基础工具
+
+在服务器执行：
+
+```bash
+sudo apt update
+sudo apt install -y curl screen
+```
+
+如果你一直用 `root` 部署，可以继续用 `root` 安装 NapCat。此时 NapCat 默认会安装到：
+
+```text
+/root/Napcat
+```
+
+如果你用普通用户安装，则默认会安装到：
+
+```text
+/home/你的用户名/Napcat
+```
+
+#### 2. 下载 NapCat 安装脚本
+
+建议单独建一个目录放安装脚本：
+
+```bash
+mkdir -p /opt/napcat-installer
+cd /opt/napcat-installer
+curl -o napcat.sh https://nclatest.znin.net/NapNeko/NapCat-Installer/main/script/install.sh
+```
+
+#### 3. 使用交互式安装
+
+第一次安装推荐用 TUI 交互模式：
+
+```bash
+sudo bash napcat.sh --tui
+```
+
+安装界面里建议这样选：
+
+```text
+安装方式：本地安装 / Shell 安装 / Rootless
+是否使用 Docker：否
+是否安装 NapCat TUI-CLI：是
+代理：如果 GitHub 下载慢，可以选择脚本提供的代理；如果服务器访问 GitHub 正常，选择不使用代理
+```
+
+如果你不想走交互界面，也可以使用非交互命令：
+
+```bash
+sudo bash napcat.sh --docker n --cli y --proxy 0
+```
+
+如果 GitHub 下载很慢，可以把 `--proxy 0` 改成脚本提示的可用代理编号，例如：
+
+```bash
+sudo bash napcat.sh --docker n --cli y --proxy 1
+```
+
+#### 4. 确认安装目录
+
+安装完成后检查：
+
+```bash
+ls -la ~/Napcat
+```
+
+如果你是 root 用户，等价于：
+
+```bash
+ls -la /root/Napcat
+```
+
+如果能看到 NapCat、QQ 或相关启动文件，说明安装完成。
+
+#### 5. 启动 NapCat 并登录 QQ
+
+安装脚本结束后，通常会在终端输出启动方式、WebUI 地址、token 或后续管理命令。优先按照安装脚本最后输出的提示启动。
+
+如果安装了 NapCat TUI-CLI，可以使用它在 SSH 里管理 NapCat。不同版本命令名可能略有变化，常见方式是查看系统里是否存在 NapCat 相关命令：
+
+```bash
+ls /usr/local/bin | grep -i napcat
+```
+
+也可以搜索安装目录：
+
+```bash
+find ~/Napcat -maxdepth 3 -type f | grep -Ei 'napcat|launcher|qq$'
+```
+
+启动后，NapCat 会要求登录 QQ。一般有两种方式：
+
+```text
+1. 终端显示二维码，直接用 QQ 扫码登录。
+2. 打开 NapCat WebUI，在 WebUI 里扫码登录。
+```
+
+#### 6. 打开 NapCat WebUI
+
+NapCat WebUI 常见端口是 `6099`，具体以启动日志输出为准。
+
+如果 WebUI 只监听服务器本机地址，推荐用 SSH 端口转发：
+
+```bash
+ssh -L 6099:127.0.0.1:6099 root@你的服务器IP
+```
+
+然后在你自己的电脑浏览器打开：
+
+```text
+http://127.0.0.1:6099
+```
+
+如果启动日志里给了 token，就按日志里的地址访问，例如：
+
+```text
+http://127.0.0.1:6099/webui/?token=日志里显示的token
+```
+
+不要长期把 NapCat WebUI 直接暴露到公网。如果必须临时开放，配置完 webhook 后建议立刻关闭公网访问。
+
+#### 7. 让 NapCat 长期运行
+
+NapCat 必须一直运行，后端才能持续收到群消息。
+
+最简单的做法是用 `screen` 保持会话：
+
+```bash
+screen -S napcat
+```
+
+在 screen 里启动 NapCat。启动成功后按：
+
+```text
+Ctrl+A，然后按 D
+```
+
+这样可以退出 screen，但 NapCat 继续在后台运行。
+
+重新进入：
+
+```bash
+screen -r napcat
+```
+
+查看当前 screen 会话：
+
+```bash
+screen -ls
+```
+
+如果安装脚本或 TUI-CLI 提供了 systemd 服务管理方式，也可以优先使用它。判断方式是查看是否有 NapCat 相关服务：
+
+```bash
+systemctl list-units --type=service | grep -i napcat
+```
+
+如果看到了服务，例如 `napcat.service`，可以这样管理：
+
+```bash
+sudo systemctl status napcat
+sudo systemctl restart napcat
+journalctl -u napcat -f
+```
+
+#### 8. 安装后的检查
+
+确认 NapCat 端口：
+
+```bash
+sudo ss -lntp | grep -E '6099|napcat|qq'
+```
+
+确认 NapCat 进程：
+
+```bash
+ps aux | grep -Ei 'napcat|qq' | grep -v grep
+```
+
+确认后端也在：
+
+```bash
+sudo systemctl status qq-message
+```
+
+这两个都正常后，再继续配置下面的 HTTP Client webhook。
+
 ### 方案 A：NapCat 和后端在同一台服务器
 
 这是最适合 24 小时自动总结的方式。
 
-NapCat 的 webhook 地址填写：
+同一台服务器部署时，NapCat 不需要通过公网域名访问后端，直接走本机地址即可：
 
 ```text
 http://127.0.0.1:8000/webhook/onebot?token=你的QQ_SUMMARY_WEBHOOK_TOKEN
@@ -395,16 +588,170 @@ http://127.0.0.1:8000/webhook/onebot?token=你的QQ_SUMMARY_WEBHOOK_TOKEN
 
 其中 `token` 必须和 `.env` 里的 `QQ_SUMMARY_WEBHOOK_TOKEN` 完全一致。
 
-NapCat HTTP Client 建议配置：
+#### 1. 先确认后端本机可访问
 
-```text
-enable: true
-messagePostFormat: array
-reportSelfMessage: false
-token: 留空
+在服务器上执行：
+
+```bash
+curl http://127.0.0.1:8000/api/auth/status
 ```
 
-同机部署时 webhook 不需要走公网域名，更安全。
+如果你设置了 `QQ_SUMMARY_WEB_PASSWORD`，正常会返回类似：
+
+```json
+{"auth_required": true, "authenticated": false}
+```
+
+再检查后端服务：
+
+```bash
+sudo systemctl status qq-message
+```
+
+如果这里正常，说明 NapCat 可以通过 `127.0.0.1:8000` 把消息推给后端。
+
+#### 2. 准备 webhook token
+
+查看 `.env` 里的 token：
+
+```bash
+cd /opt/qq_message
+grep QQ_SUMMARY_WEBHOOK_TOKEN .env
+```
+
+假设输出是：
+
+```env
+QQ_SUMMARY_WEBHOOK_TOKEN=abc123456
+```
+
+那么 NapCat webhook 地址就是：
+
+```text
+http://127.0.0.1:8000/webhook/onebot?token=abc123456
+```
+
+注意：这里使用的是 `QQ_SUMMARY_WEBHOOK_TOKEN`，不是 `QQ_SUMMARY_WEB_PASSWORD`。
+
+#### 3. 打开 NapCat WebUI
+
+在服务器上启动 NapCat 后，打开 NapCat WebUI。
+
+如果你的 NapCat WebUI 只监听本机地址，通常需要用 SSH 端口转发从本地电脑打开：
+
+```bash
+ssh -L 6099:127.0.0.1:6099 root@你的服务器IP
+```
+
+然后在本地浏览器打开：
+
+```text
+http://127.0.0.1:6099
+```
+
+如果你的 NapCat WebUI 已经暴露在公网，也可以直接打开它的公网地址，但不建议长期把 NapCat WebUI 暴露到公网。
+
+#### 4. 新增 HTTP Client
+
+在 NapCat WebUI 里找到类似下面的位置：
+
+```text
+网络配置 / Webhook / HTTP Client / HTTP 上报
+```
+
+不同 NapCat 版本菜单名字可能略有不同，目标是新增一个“HTTP Client”或“HTTP 上报”配置。
+
+推荐命名：
+
+```text
+qq-message-summary
+```
+
+字段按下面填写：
+
+```text
+启用 / enable: true
+名称 / name: qq-message-summary
+URL / url: http://127.0.0.1:8000/webhook/onebot?token=你的QQ_SUMMARY_WEBHOOK_TOKEN
+上报格式 / messagePostFormat: array
+是否上报自己消息 / reportSelfMessage: false
+Token / token: 留空
+```
+
+如果界面里有这些选项，也建议这样设置：
+
+```text
+上报方式: POST
+Content-Type: application/json
+超时时间: 默认即可
+重试: 默认即可
+启用群消息上报: 开启
+启用私聊消息上报: 可不开启
+```
+
+本项目只处理 QQ 群消息，私聊、通知、好友请求等事件会被后端忽略。
+
+#### 5. 保存并测试
+
+保存 HTTP Client 后，在任意一个 QQ 群里发一条新消息，或者等群里出现新消息。
+
+然后在服务器上看后端日志：
+
+```bash
+journalctl -u qq-message -f
+```
+
+正常情况下会看到类似请求记录：
+
+```text
+"POST /webhook/onebot?token=xxx HTTP/1.1" 200
+```
+
+再打开网页：
+
+```text
+https://message.tanlb.xyz
+```
+
+登录后应该能看到新群或新的未读消息。
+
+#### 6. 常见配置错误
+
+如果 NapCat 显示上报失败，优先检查这些：
+
+```text
+1. 后端服务 qq-message 是否正在运行。
+2. URL 是否写成了 http://127.0.0.1:8000/webhook/onebot?token=xxx。
+3. token 是否和 .env 里的 QQ_SUMMARY_WEBHOOK_TOKEN 完全一致。
+4. messagePostFormat 是否为 array。
+5. NapCat 是否真的和后端在同一台服务器上。
+```
+
+如果后端日志出现：
+
+```json
+{"error": "Invalid webhook token"}
+```
+
+说明 webhook URL 里的 `token` 写错了。
+
+如果后端日志一直没有任何 `/webhook/onebot` 请求，说明 NapCat 没有把事件推到后端。重点检查 NapCat HTTP Client 是否启用、URL 是否保存成功、NapCat 是否在线。
+
+#### 7. 同机部署为什么不用公网域名
+
+同机部署时推荐用：
+
+```text
+http://127.0.0.1:8000/webhook/onebot?token=xxx
+```
+
+而不是：
+
+```text
+https://message.tanlb.xyz/webhook/onebot?token=xxx
+```
+
+原因是本机地址更稳定，也不会经过 Cloudflare、Nginx、公网 DNS 或服务器安全组。即使公网域名临时访问异常，只要后端和 NapCat 都在同一台服务器上，NapCat 仍然可以继续把消息推给后端。
 
 ### 方案 B：NapCat 在另一台机器
 

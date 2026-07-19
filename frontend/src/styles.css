@@ -674,7 +674,32 @@ button:disabled {
 }
 
 .history-scroll {
-  padding: 8px 12px 12px;
+  padding: 0 12px 12px;
+}
+
+.history-virtual-list {
+  position: relative;
+  width: 100%;
+}
+
+.history-marker-virtual,
+.history-virtual-row {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+}
+
+.history-marker-virtual {
+  height: 34px;
+}
+
+.history-virtual-row {
+  will-change: transform;
+}
+
+.history-virtual-row .message-item {
+  border-bottom: 1px solid #edf2f7;
 }
 
 .message-item {

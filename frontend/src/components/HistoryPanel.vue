@@ -30,12 +30,27 @@
     </div>
 
     <div ref="scroller" class="history-scroll" @scroll="handleScroll">
-      <div v-if="messages.length" class="history-marker">
-        <LoaderCircle v-if="loading && hasMore" :size="15" class="spinning" />
-        <span v-else>{{ hasMore ? "上滑加载更早消息" : "已到最早消息" }}</span>
-      </div>
+      <div
+        v-if="messages.length"
+        class="history-virtual-list"
+        :style="{ height: `${virtualTotalSize}px` }"
+      >
+        <div class="history-marker history-marker-virtual">
+          <LoaderCircle v-if="loading && hasMore" :size="15" class="spinning" />
+          <span v-else>{{ hasMore ? "上滑加载更早消息" : "已到最早消息" }}</span>
+        </div>
 
-      <MessageItem v-for="message in messages" :key="message.message_id" :message="message" />
+        <div
+          v-for="virtualRow in virtualRows"
+          :key="virtualRow.key"
+          :ref="measureVirtualRow"
+          class="history-virtual-row"
+          :data-index="virtualRow.index"
+          :style="virtualRowStyle(virtualRow)"
+        >
+          <MessageItem :message="messages[virtualRow.index]" />
+        </div>
+      </div>
 
       <EmptyState
         v-if="!messages.length"
@@ -48,12 +63,17 @@
 </template>
 
 <script setup>
-import { ref } from "vue";
+import { computed, ref } from "vue";
+import { useVirtualizer } from "@tanstack/vue-virtual";
 import { Archive, CalendarDays, Clock3, LoaderCircle, Search, Trash2 } from "@lucide/vue";
 import EmptyState from "./EmptyState.vue";
 import MessageItem from "./MessageItem.vue";
 
-defineProps({
+const HISTORY_MARKER_HEIGHT = 34;
+const ESTIMATED_MESSAGE_HEIGHT = 86;
+const VIRTUAL_OVERSCAN = 8;
+
+const props = defineProps({
   messages: {
     type: Array,
     required: true,
@@ -82,6 +102,26 @@ defineProps({
 
 const emit = defineEmits(["load-more", "load-date", "clear-date", "delete-date", "update:date"]);
 const scroller = ref(null);
+const virtualizer = useVirtualizer(computed(() => ({
+  count: props.messages.length,
+  getScrollElement: () => scroller.value,
+  estimateSize: () => ESTIMATED_MESSAGE_HEIGHT,
+  getItemKey: (index) => props.messages[index]?.message_id ?? index,
+  overscan: VIRTUAL_OVERSCAN,
+  paddingStart: HISTORY_MARKER_HEIGHT,
+})));
+const virtualRows = computed(() => virtualizer.value.getVirtualItems());
+const virtualTotalSize = computed(() => virtualizer.value.getTotalSize());
+
+function measureVirtualRow(element) {
+  if (element) virtualizer.value.measureElement(element);
+}
+
+function virtualRowStyle(virtualRow) {
+  return {
+    transform: `translateY(${virtualRow.start}px)`,
+  };
+}
 
 function handleScroll(event) {
   if (event.currentTarget.scrollTop <= 24) {
@@ -91,28 +131,29 @@ function handleScroll(event) {
 
 function scrollToBottom() {
   requestAnimationFrame(() => {
-    if (!scroller.value) return;
-    scroller.value.scrollTop = scroller.value.scrollHeight;
+    if (!scroller.value || !props.messages.length) return;
+    virtualizer.value.scrollToEnd();
   });
 }
 
 function preservePosition(previousHeight, previousTop) {
   requestAnimationFrame(() => {
     if (!scroller.value) return;
-    scroller.value.scrollTop = scroller.value.scrollHeight - previousHeight + previousTop;
+    const nextTop = virtualizer.value.getTotalSize() - previousHeight + previousTop;
+    virtualizer.value.scrollToOffset(Math.max(nextTop, 0));
   });
 }
 
 function isNearBottom() {
   if (!scroller.value) return true;
-  const distance = scroller.value.scrollHeight - scroller.value.scrollTop - scroller.value.clientHeight;
+  const distance = virtualizer.value.getTotalSize() - scroller.value.scrollTop - scroller.value.clientHeight;
   return distance <= 80;
 }
 
 function getScrollSnapshot() {
   if (!scroller.value) return { height: 0, top: 0 };
   return {
-    height: scroller.value.scrollHeight,
+    height: virtualizer.value.getTotalSize(),
     top: scroller.value.scrollTop,
   };
 }
