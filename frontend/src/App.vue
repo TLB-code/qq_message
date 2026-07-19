@@ -546,11 +546,14 @@ async function loadHistoryMessages({ reset = false, date = history.date, preserv
       cursor: reset ? null : history.nextCursor,
       date: history.date,
       limit: HISTORY_PAGE_SIZE,
+      includeTotal: reset,
     });
     if (selectedGroupId.value !== groupId || history.groupId !== groupId) return;
 
     const messages = data.messages || [];
-    history.totalCount = Number(data.total_count || 0);
+    if (data.total_count !== undefined) {
+      history.totalCount = Number(data.total_count || 0);
+    }
     if (reset) {
       history.messages = messages;
     } else {
@@ -589,11 +592,14 @@ async function loadSummaryHistory({ reset = false } = {}) {
     const data = await getSummaries(groupId, {
       cursor: reset ? null : summaryHistory.nextCursor,
       limit: SUMMARY_PAGE_SIZE,
+      includeTotal: reset,
     });
     if (selectedGroupId.value !== groupId || summaryHistory.groupId !== groupId) return;
 
     const records = data.summaries || [];
-    summaryHistory.totalCount = Number(data.total_count || 0);
+    if (data.total_count !== undefined) {
+      summaryHistory.totalCount = Number(data.total_count || 0);
+    }
     if (reset) {
       summaryHistory.summaries = records;
     } else {
@@ -616,10 +622,9 @@ async function appendNewHistoryMessagesIfAtBottom() {
   if (!groupId || history.groupId !== groupId || !history.initialized || history.isLoading || history.date) return;
   if (!historyPanel.value?.isNearBottom()) return;
 
-  const data = await getHistory(groupId, { limit: HISTORY_PAGE_SIZE });
+  const data = await getHistory(groupId, { limit: HISTORY_PAGE_SIZE, includeTotal: false });
   if (selectedGroupId.value !== groupId || history.groupId !== groupId) return;
 
-  history.totalCount = Number(data.total_count || 0);
   const known = new Set(history.messages.map((message) => message.message_id));
   const newer = (data.messages || []).filter((message) => !known.has(message.message_id));
   if (!newer.length) return;

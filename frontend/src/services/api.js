@@ -42,8 +42,11 @@ export function getGroupDetail(groupId, limit = 500) {
   return requestJson(`/api/groups/${encodeURIComponent(groupId)}?limit=${limit}`);
 }
 
-export function getSummaries(groupId, { cursor = null, limit = 5 } = {}) {
-  const params = new URLSearchParams({ limit: String(limit) });
+export function getSummaries(groupId, { cursor = null, limit = 5, includeTotal = true } = {}) {
+  const params = new URLSearchParams({
+    limit: String(limit),
+    include_total: String(includeTotal),
+  });
   if (cursor) {
     params.set("before_id", String(cursor.before_id));
   }
@@ -82,8 +85,11 @@ export function setGroupAutoSummary(groupId, enabled) {
   });
 }
 
-export function getHistory(groupId, { cursor = null, date = "", limit = 50 } = {}) {
-  const params = new URLSearchParams({ limit: String(limit) });
+export function getHistory(groupId, { cursor = null, date = "", limit = 50, includeTotal = true } = {}) {
+  const params = new URLSearchParams({
+    limit: String(limit),
+    include_total: String(includeTotal),
+  });
   if (date) params.set("date", date);
   if (cursor) {
     params.set("before_timestamp", String(cursor.before_timestamp));

@@ -154,6 +154,13 @@ def parse_history_date(value: str) -> tuple[int, int, str]:
     return int(started_at.timestamp()), int(ended_at.timestamp()), day.isoformat()
 
 
+def query_bool(query: dict[str, list[str]], name: str, default: bool = False) -> bool:
+    values = query.get(name)
+    if not values:
+        return default
+    return values[0].strip().lower() in {"1", "true", "yes", "on"}
+
+
 def web_auth_enabled() -> bool:
     return bool(SETTINGS.web_password)
 
@@ -536,6 +543,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             requested_limit = DEFAULT_SUMMARY_HISTORY_LIMIT
         limit = min(max(requested_limit, 1), MAX_SUMMARY_HISTORY_LIMIT)
+        include_total = query_bool(query, "include_total", default=True)
 
         before_id: int | None = None
         if query.get("before_id"):
@@ -552,17 +560,16 @@ class RequestHandler(BaseHTTPRequestHandler):
         if has_more and summaries:
             next_cursor = {"before_id": summaries[-1]["id"]}
 
-        self._json(
-            HTTPStatus.OK,
-            {
-                "group": group,
-                "summaries": summaries,
-                "total_count": STORE.count_summaries(group_id),
-                "has_more": has_more,
-                "next_cursor": next_cursor,
-                "limit": limit,
-            },
-        )
+        payload = {
+            "group": group,
+            "summaries": summaries,
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+            "limit": limit,
+        }
+        if include_total:
+            payload["total_count"] = STORE.count_summaries(group_id)
+        self._json(HTTPStatus.OK, payload)
 
     def _handle_history_get(self, group_id: str, query: dict[str, list[str]]) -> None:
         group = STORE.get_group(group_id)
@@ -575,6 +582,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             requested_limit = DEFAULT_HISTORY_LIMIT
         limit = min(max(requested_limit, 1), MAX_HISTORY_LIMIT)
+        include_total = query_bool(query, "include_total", default=True)
 
         before_timestamp: int | None = None
         before_message_id: str | None = None
@@ -603,11 +611,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             start_timestamp=start_timestamp,
             end_timestamp=end_timestamp,
         )
-        total_count = STORE.count_message_records(
-            group_id,
-            start_timestamp=start_timestamp,
-            end_timestamp=end_timestamp,
-        )
         has_more = len(records) > limit
         records = records[-limit:]
         messages = [message_payload_from_record(record) for record in records]
@@ -619,18 +622,21 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "before_message_id": first["message_id"],
             }
 
-        self._json(
-            HTTPStatus.OK,
-            {
-                "group": group,
-                "messages": messages,
-                "total_count": total_count,
-                "has_more": has_more,
-                "next_cursor": next_cursor,
-                "limit": limit,
-                "date": selected_date,
-            },
-        )
+        payload = {
+            "group": group,
+            "messages": messages,
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+            "limit": limit,
+            "date": selected_date,
+        }
+        if include_total:
+            payload["total_count"] = STORE.count_message_records(
+                group_id,
+                start_timestamp=start_timestamp,
+                end_timestamp=end_timestamp,
+            )
+        self._json(HTTPStatus.OK, payload)
 
     def _handle_group_delete(self, path: str, query: dict[str, list[str]]) -> None:
         parts = path.strip("/").split("/")

@@ -13,6 +13,7 @@ from app.server import (
     is_allowed_media_url,
     media_proxy_url,
     message_payload_from_record,
+    query_bool,
     revoke_web_session,
     summarize_group_messages,
     summary_message_from_record,
@@ -217,6 +218,11 @@ class AppTests(unittest.TestCase):
 
         self.assertFalse(is_valid_web_session(token))
 
+    def test_query_bool_defaults_and_parses_flags(self):
+        self.assertTrue(query_bool({}, "include_total", default=True))
+        self.assertFalse(query_bool({"include_total": ["false"]}, "include_total", default=True))
+        self.assertTrue(query_bool({"include_total": ["1"]}, "include_total"))
+
     def test_store_tracks_unread_cursor(self):
         with TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "test.sqlite3")
@@ -249,6 +255,101 @@ class AppTests(unittest.TestCase):
             store.save_summary("1", first_two, "summary", "test-model", 200)
 
             self.assertEqual(store.count_unread_message_records("1"), 2)
+
+    def test_store_maintains_cached_group_counts(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "test.sqlite3")
+            store.init()
+            store.upsert_group("1", "test group", 100)
+            first = Message("1", "1", "u1", "user", "first", 100)
+            second = Message("2", "1", "u1", "user", "second", 101)
+
+            self.assertTrue(store.save_message(first, {"message_id": "1"}))
+            self.assertTrue(store.save_message(second, {"message_id": "2"}))
+            self.assertFalse(store.save_message(second, {"message_id": "2"}))
+
+            group = store.get_group("1")
+            self.assertEqual(group["message_count"], 2)
+            self.assertEqual(group["unread_count"], 2)
+            self.assertEqual(group["latest_timestamp"], 101)
+
+            store.save_summary("1", [first], "summary", "test-model", 102)
+            group_after_summary = store.get_group("1")
+            self.assertEqual(group_after_summary["message_count"], 2)
+            self.assertEqual(group_after_summary["unread_count"], 1)
+
+            store.mark_read("1", now=103)
+            self.assertEqual(store.get_group("1")["unread_count"], 0)
+
+            store.save_message(Message("old", "1", "u1", "user", "old", 99), {"message_id": "old"})
+            self.assertEqual(store.get_group("1")["unread_count"], 0)
+
+            store.save_message(Message("3", "1", "u1", "user", "third", 102), {"message_id": "3"})
+            final_group = store.get_group("1")
+            self.assertEqual(final_group["message_count"], 4)
+            self.assertEqual(final_group["unread_count"], 1)
+            self.assertEqual(final_group["latest_timestamp"], 102)
+
+    def test_store_migrates_and_backfills_group_stats(self):
+        with TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "test.sqlite3"
+            store = Store(database_path)
+            with store.connect() as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE groups (
+                        group_id TEXT PRIMARY KEY,
+                        group_name TEXT NOT NULL,
+                        auto_summary_enabled INTEGER NOT NULL DEFAULT 0,
+                        updated_at INTEGER NOT NULL
+                    );
+                    CREATE TABLE messages (
+                        message_id TEXT PRIMARY KEY,
+                        group_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        sender_name TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        timestamp INTEGER NOT NULL,
+                        raw_json TEXT NOT NULL
+                    );
+                    CREATE TABLE summary_cursors (
+                        group_id TEXT PRIMARY KEY,
+                        last_message_id TEXT,
+                        last_timestamp INTEGER,
+                        updated_at INTEGER NOT NULL
+                    );
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO groups (group_id, group_name, updated_at) VALUES ('1', 'group', 102)"
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO messages
+                        (message_id, group_id, user_id, sender_name, content, timestamp, raw_json)
+                    VALUES (?, '1', 'u1', 'user', ?, ?, '{}')
+                    """,
+                    [
+                        ("1", "first", 100),
+                        ("2", "second", 101),
+                        ("3", "third", 102),
+                    ],
+                )
+                conn.execute(
+                    """
+                    INSERT INTO summary_cursors
+                        (group_id, last_message_id, last_timestamp, updated_at)
+                    VALUES ('1', '1', 100, 103)
+                    """
+                )
+
+            store.init()
+
+            group = store.get_group("1")
+            self.assertEqual(group["message_count"], 3)
+            self.assertEqual(group["unread_count"], 2)
+            self.assertEqual(group["latest_timestamp"], 102)
+            self.assertEqual(store.list_groups()[0]["message_count"], 3)
 
     def test_store_group_auto_summary_defaults_off_and_can_toggle(self):
         with TemporaryDirectory() as tmp:
@@ -360,6 +461,13 @@ class AppTests(unittest.TestCase):
             store.save_message(Message("in-1", "1", "u1", "user", "in 1", 100), {"message_id": "in-1"})
             store.save_message(Message("in-2", "1", "u1", "user", "in 2", 101), {"message_id": "in-2"})
             store.save_message(Message("new", "1", "u1", "user", "new", 200), {"message_id": "new"})
+            store.save_summary(
+                "1",
+                [Message("old", "1", "u1", "user", "old", 99)],
+                "old summary",
+                "test-model",
+                201,
+            )
 
             records = store.list_history_message_records(
                 "1",
@@ -377,6 +485,10 @@ class AppTests(unittest.TestCase):
             self.assertEqual(range_count, 2)
             self.assertEqual(deleted_count, 2)
             self.assertEqual([row["message_id"] for row in remaining], ["old", "new"])
+            group = store.get_group("1")
+            self.assertEqual(group["message_count"], 2)
+            self.assertEqual(group["unread_count"], 1)
+            self.assertEqual(group["latest_timestamp"], 200)
 
     def test_store_pages_summaries_before_id(self):
         with TemporaryDirectory() as tmp:

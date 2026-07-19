@@ -41,6 +41,9 @@ class Store:
                     group_id TEXT PRIMARY KEY,
                     group_name TEXT NOT NULL,
                     auto_summary_enabled INTEGER NOT NULL DEFAULT 0,
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    unread_count INTEGER NOT NULL DEFAULT 0,
+                    latest_timestamp INTEGER,
                     updated_at INTEGER NOT NULL
                 );
 
@@ -88,12 +91,67 @@ class Store:
             }
             if "auto_summary_enabled" not in group_columns:
                 conn.execute("ALTER TABLE groups ADD COLUMN auto_summary_enabled INTEGER NOT NULL DEFAULT 0")
+            stats_migration_needed = False
+            if "message_count" not in group_columns:
+                conn.execute("ALTER TABLE groups ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0")
+                stats_migration_needed = True
+            if "unread_count" not in group_columns:
+                conn.execute("ALTER TABLE groups ADD COLUMN unread_count INTEGER NOT NULL DEFAULT 0")
+                stats_migration_needed = True
+            if "latest_timestamp" not in group_columns:
+                conn.execute("ALTER TABLE groups ADD COLUMN latest_timestamp INTEGER")
+                stats_migration_needed = True
             columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(summaries)").fetchall()
             }
             if "is_read" not in columns:
                 conn.execute("ALTER TABLE summaries ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0")
+            if stats_migration_needed:
+                self._rebuild_group_stats(conn)
+
+    def _rebuild_group_stats(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT
+                g.group_id,
+                COUNT(m.message_id) AS message_count,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN m.message_id IS NULL THEN 0
+                            WHEN c.last_timestamp IS NULL THEN 1
+                            WHEN m.timestamp > c.last_timestamp THEN 1
+                            WHEN m.timestamp = c.last_timestamp
+                                 AND m.message_id > COALESCE(c.last_message_id, '') THEN 1
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS unread_count,
+                MAX(m.timestamp) AS latest_timestamp
+            FROM groups g
+            LEFT JOIN messages m ON m.group_id = g.group_id
+            LEFT JOIN summary_cursors c ON c.group_id = g.group_id
+            GROUP BY g.group_id
+            """
+        ).fetchall()
+        conn.executemany(
+            """
+            UPDATE groups
+            SET message_count = ?, unread_count = ?, latest_timestamp = ?
+            WHERE group_id = ?
+            """,
+            [
+                (
+                    int(row["message_count"] or 0),
+                    int(row["unread_count"] or 0),
+                    row["latest_timestamp"],
+                    row["group_id"],
+                )
+                for row in rows
+            ],
+        )
 
     def upsert_group(self, group_id: str, group_name: str, updated_at: int) -> None:
         with self.connect() as conn:
@@ -103,7 +161,10 @@ class Store:
                 VALUES (?, ?, ?)
                 ON CONFLICT(group_id) DO UPDATE SET
                     group_name = excluded.group_name,
-                    updated_at = excluded.updated_at
+                    updated_at = CASE
+                        WHEN excluded.updated_at > groups.updated_at THEN excluded.updated_at
+                        ELSE groups.updated_at
+                    END
                 """,
                 (group_id, group_name or group_id, updated_at),
             )
@@ -126,32 +187,59 @@ class Store:
                     json.dumps(raw, ensure_ascii=False),
                 ),
             )
-            return result.rowcount > 0
+            inserted = result.rowcount > 0
+            if inserted:
+                cursor = conn.execute(
+                    """
+                    SELECT last_message_id, last_timestamp
+                    FROM summary_cursors
+                    WHERE group_id = ?
+                    """,
+                    (message.group_id,),
+                ).fetchone()
+                is_unread = (
+                    cursor is None
+                    or cursor["last_timestamp"] is None
+                    or message.timestamp > cursor["last_timestamp"]
+                    or (
+                        message.timestamp == cursor["last_timestamp"]
+                        and message.message_id > (cursor["last_message_id"] or "")
+                    )
+                )
+                conn.execute(
+                    """
+                    UPDATE groups
+                    SET message_count = message_count + 1,
+                        unread_count = unread_count + ?,
+                        latest_timestamp = CASE
+                            WHEN latest_timestamp IS NULL OR ? > latest_timestamp THEN ?
+                            ELSE latest_timestamp
+                        END,
+                        updated_at = CASE
+                            WHEN ? > updated_at THEN ?
+                            ELSE updated_at
+                        END
+                    WHERE group_id = ?
+                    """,
+                    (
+                        1 if is_unread else 0,
+                        message.timestamp,
+                        message.timestamp,
+                        message.timestamp,
+                        message.timestamp,
+                        message.group_id,
+                    ),
+                )
+            return inserted
 
     def list_groups(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT
-                    g.group_id,
-                    g.group_name,
-                    g.auto_summary_enabled,
-                    g.updated_at,
-                    COUNT(m.message_id) AS message_count,
-                    SUM(
-                        CASE
-                            WHEN c.last_timestamp IS NULL THEN 1
-                            WHEN m.timestamp > c.last_timestamp THEN 1
-                            WHEN m.timestamp = c.last_timestamp AND m.message_id > COALESCE(c.last_message_id, '') THEN 1
-                            ELSE 0
-                        END
-                    ) AS unread_count,
-                    MAX(m.timestamp) AS latest_timestamp
-                FROM groups g
-                LEFT JOIN messages m ON m.group_id = g.group_id
-                LEFT JOIN summary_cursors c ON c.group_id = g.group_id
-                GROUP BY g.group_id
-                ORDER BY latest_timestamp DESC, g.updated_at DESC
+                SELECT group_id, group_name, auto_summary_enabled, updated_at,
+                       message_count, unread_count, latest_timestamp
+                FROM groups
+                ORDER BY latest_timestamp DESC, updated_at DESC
                 """
             ).fetchall()
             return [dict(row) for row in rows]
@@ -159,7 +247,12 @@ class Store:
     def get_group(self, group_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT group_id, group_name, auto_summary_enabled, updated_at FROM groups WHERE group_id = ?",
+                """
+                SELECT group_id, group_name, auto_summary_enabled, updated_at,
+                       message_count, unread_count, latest_timestamp
+                FROM groups
+                WHERE group_id = ?
+                """,
                 (group_id,),
             ).fetchone()
             return dict(row) if row else None
@@ -178,7 +271,12 @@ class Store:
                 (1 if enabled else 0, group_id),
             )
             row = conn.execute(
-                "SELECT group_id, group_name, auto_summary_enabled, updated_at FROM groups WHERE group_id = ?",
+                """
+                SELECT group_id, group_name, auto_summary_enabled, updated_at,
+                       message_count, unread_count, latest_timestamp
+                FROM groups
+                WHERE group_id = ?
+                """,
                 (group_id,),
             ).fetchone()
             return dict(row) if row else None
@@ -315,42 +413,11 @@ class Store:
 
     def count_unread_message_records(self, group_id: str) -> int:
         with self.connect() as conn:
-            cursor = conn.execute(
-                """
-                SELECT last_message_id, last_timestamp
-                FROM summary_cursors
-                WHERE group_id = ?
-                """,
+            row = conn.execute(
+                "SELECT unread_count FROM groups WHERE group_id = ?",
                 (group_id,),
             ).fetchone()
-            if cursor is None or cursor["last_timestamp"] is None:
-                row = conn.execute(
-                    """
-                    SELECT COUNT(*) AS count
-                    FROM messages
-                    WHERE group_id = ?
-                    """,
-                    (group_id,),
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    """
-                    SELECT COUNT(*) AS count
-                    FROM messages
-                    WHERE group_id = ?
-                      AND (
-                        timestamp > ?
-                        OR (timestamp = ? AND message_id > ?)
-                      )
-                    """,
-                    (
-                        group_id,
-                        cursor["last_timestamp"],
-                        cursor["last_timestamp"],
-                        cursor["last_message_id"] or "",
-                    ),
-                ).fetchone()
-            return int(row["count"] or 0)
+            return int(row["unread_count"] or 0) if row else 0
 
     def list_recent_messages(self, group_id: str, limit: int = 50) -> list[Message]:
         with self.connect() as conn:
@@ -422,6 +489,14 @@ class Store:
         start_timestamp: int | None = None,
         end_timestamp: int | None = None,
     ) -> int:
+        if start_timestamp is None and end_timestamp is None:
+            with self.connect() as conn:
+                row = conn.execute(
+                    "SELECT message_count FROM groups WHERE group_id = ?",
+                    (group_id,),
+                ).fetchone()
+                return int(row["message_count"] or 0) if row else 0
+
         filters = ["group_id = ?"]
         params: list[Any] = [group_id]
         if start_timestamp is not None:
@@ -457,6 +532,51 @@ class Store:
         end_timestamp: int,
     ) -> int:
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                SELECT last_message_id, last_timestamp
+                FROM summary_cursors
+                WHERE group_id = ?
+                """,
+                (group_id,),
+            ).fetchone()
+            if cursor is None or cursor["last_timestamp"] is None:
+                counts = conn.execute(
+                    """
+                    SELECT COUNT(*) AS message_count, COUNT(*) AS unread_count
+                    FROM messages
+                    WHERE group_id = ? AND timestamp >= ? AND timestamp < ?
+                    """,
+                    (group_id, start_timestamp, end_timestamp),
+                ).fetchone()
+            else:
+                counts = conn.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS message_count,
+                        COALESCE(
+                            SUM(
+                                CASE
+                                    WHEN timestamp > ? THEN 1
+                                    WHEN timestamp = ? AND message_id > ? THEN 1
+                                    ELSE 0
+                                END
+                            ),
+                            0
+                        ) AS unread_count
+                    FROM messages
+                    WHERE group_id = ? AND timestamp >= ? AND timestamp < ?
+                    """,
+                    (
+                        cursor["last_timestamp"],
+                        cursor["last_timestamp"],
+                        cursor["last_message_id"] or "",
+                        group_id,
+                        start_timestamp,
+                        end_timestamp,
+                    ),
+                ).fetchone()
             result = conn.execute(
                 """
                 DELETE FROM messages
@@ -467,6 +587,26 @@ class Store:
                 (group_id, start_timestamp, end_timestamp),
             )
             deleted_count = int(result.rowcount or 0)
+            if deleted_count:
+                latest = conn.execute(
+                    "SELECT MAX(timestamp) AS latest_timestamp FROM messages WHERE group_id = ?",
+                    (group_id,),
+                ).fetchone()
+                conn.execute(
+                    """
+                    UPDATE groups
+                    SET message_count = MAX(message_count - ?, 0),
+                        unread_count = MAX(unread_count - ?, 0),
+                        latest_timestamp = ?
+                    WHERE group_id = ?
+                    """,
+                    (
+                        int(counts["message_count"] or 0),
+                        int(counts["unread_count"] or 0),
+                        latest["latest_timestamp"],
+                        group_id,
+                    ),
+                )
         if deleted_count:
             vacuum_conn = sqlite3.connect(self.database_path)
             try:
@@ -490,6 +630,25 @@ class Store:
         first = messages[0]
         last = messages[-1]
         with self.connect() as conn:
+            existing_cursor = conn.execute(
+                """
+                SELECT last_message_id, last_timestamp
+                FROM summary_cursors
+                WHERE group_id = ?
+                """,
+                (group_id,),
+            ).fetchone()
+            processed_unread_count = sum(
+                1
+                for message in messages
+                if existing_cursor is None
+                or existing_cursor["last_timestamp"] is None
+                or message.timestamp > existing_cursor["last_timestamp"]
+                or (
+                    message.timestamp == existing_cursor["last_timestamp"]
+                    and message.message_id > (existing_cursor["last_message_id"] or "")
+                )
+            )
             cursor = conn.execute(
                 """
                 INSERT INTO summaries (
@@ -529,6 +688,14 @@ class Store:
                         updated_at = excluded.updated_at
                     """,
                     (group_id, last.message_id, last.timestamp, created_at),
+                )
+                conn.execute(
+                    """
+                    UPDATE groups
+                    SET unread_count = MAX(unread_count - ?, 0)
+                    WHERE group_id = ?
+                    """,
+                    (processed_unread_count, group_id),
                 )
             return summary_id
 
@@ -599,12 +766,21 @@ class Store:
             return dict(row) if row else None
 
     def mark_read(self, group_id: str, now: int) -> dict[str, Any]:
-        messages = self.list_recent_messages(group_id, limit=1)
-        if not messages:
-            raise ValueError("No messages to mark as read")
-
-        last = messages[-1]
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT message_id, group_id, user_id, sender_name, content, timestamp
+                FROM messages
+                WHERE group_id = ?
+                ORDER BY timestamp DESC, message_id DESC
+                LIMIT 1
+                """,
+                (group_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("No messages to mark as read")
+            last = Message(**dict(row))
             conn.execute(
                 """
                 INSERT INTO summary_cursors (group_id, last_message_id, last_timestamp, updated_at)
@@ -615,5 +791,9 @@ class Store:
                     updated_at = excluded.updated_at
                 """,
                 (group_id, last.message_id, last.timestamp, now),
+            )
+            conn.execute(
+                "UPDATE groups SET unread_count = 0 WHERE group_id = ?",
+                (group_id,),
             )
         return {"last_message_id": last.message_id, "last_timestamp": last.timestamp}
