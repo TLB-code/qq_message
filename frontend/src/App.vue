@@ -91,7 +91,7 @@
       <section class="overview-strip">
         <div>
           <span>未读</span>
-          <strong>{{ unreadMessages.length }}</strong>
+          <strong>{{ unreadTotalCount }}</strong>
         </div>
         <div>
           <span>本地总消息</span>
@@ -103,7 +103,7 @@
         </div>
         <div>
           <span>自动刷新</span>
-          <strong>1 秒</strong>
+          <strong>3 秒</strong>
         </div>
       </section>
 
@@ -127,14 +127,21 @@
           >
             <Inbox :size="18" />
             <span>未读</span>
-            <strong>{{ unreadMessages.length }}</strong>
+            <strong>{{ unreadTotalCount }}</strong>
             <ChevronRight :size="14" />
           </button>
           <template v-else>
             <button class="panel-collapse-button" type="button" title="收起未读消息" @click="togglePanel('unread')">
               <ChevronLeft :size="15" />
             </button>
-            <UnreadPanel :unread="unreadMessages" />
+            <UnreadPanel
+              ref="unreadPanel"
+              :messages="unreadMessages"
+              :total-count="unreadTotalCount"
+              :has-more="unread.hasMore"
+              :loading="unread.isLoading"
+              @load-more="loadMoreUnread"
+            />
           </template>
         </div>
 
@@ -258,6 +265,7 @@ import {
   getGroupDetail,
   getHistory,
   getSummaries,
+  getUnreadMessages,
   listGroups,
   login,
   markGroupRead,
@@ -268,6 +276,7 @@ import {
 import { formatFullTime } from "./utils/format";
 
 const AUTO_REFRESH_INTERVAL_MS = 3000;
+const UNREAD_PAGE_SIZE = 100;
 const HISTORY_PAGE_SIZE = 50;
 const SUMMARY_PAGE_SIZE = 5;
 const PANEL_IDS = ["unread", "summary", "history"];
@@ -284,6 +293,7 @@ const selectedGroup = ref(null);
 const markingSummaryReadIds = ref([]);
 const isRefreshing = ref(false);
 const isMutating = ref(false);
+const unreadPanel = ref(null);
 const historyPanel = ref(null);
 const panelGrid = ref(null);
 const status = reactive({ message: "", type: "" });
@@ -294,6 +304,16 @@ const auth = reactive({
   password: "",
   isLoading: false,
   error: "",
+});
+const unread = reactive({
+  groupId: null,
+  messages: [],
+  nextCursor: null,
+  hasMore: false,
+  isLoading: false,
+  initialized: false,
+  totalCount: 0,
+  syncedTotalCount: 0,
 });
 const history = reactive({
   groupId: null,
@@ -340,14 +360,16 @@ const resizeState = reactive({
 
 let refreshTimer = null;
 
-const unreadMessages = computed(() => selectedGroup.value?.unread || []);
+const unreadMessages = computed(() => unread.messages);
 const summaries = computed(() => summaryHistory.summaries);
 const selectedGroupStats = computed(() => {
   const found = groups.value.find((group) => group.group_id === selectedGroupId.value);
   return {
     messageCount: found?.message_count || 0,
+    unreadCount: found ? Number(found.unread_count || 0) : null,
   };
 });
+const unreadTotalCount = computed(() => selectedGroupStats.value.unreadCount ?? unread.totalCount);
 const summaryTotalCount = computed(() => summaryHistory.totalCount);
 const historyTotalCount = computed(() => {
   if (history.loadedDate) return history.totalCount;
@@ -356,7 +378,7 @@ const historyTotalCount = computed(() => {
 const selectedGroupAutoSummaryEnabled = computed(() =>
   Boolean(selectedGroup.value?.group?.auto_summary_enabled),
 );
-const canMutateUnread = computed(() => Boolean(selectedGroupId.value && unreadMessages.value.length && !isMutating.value));
+const canMutateUnread = computed(() => Boolean(selectedGroupId.value && unreadTotalCount.value && !isMutating.value));
 const canSummarize = computed(() => canMutateUnread.value);
 const hasCollapsedPanels = computed(() => PANEL_IDS.some((id) => layout.collapsedPanels[id]));
 const contentGridStyle = computed(() => ({
@@ -488,6 +510,17 @@ function resetHistoryState(groupId, date = "") {
   history.loadedDate = date;
 }
 
+function resetUnreadState(groupId) {
+  unread.groupId = groupId;
+  unread.messages = [];
+  unread.nextCursor = null;
+  unread.hasMore = false;
+  unread.isLoading = false;
+  unread.initialized = false;
+  unread.totalCount = 0;
+  unread.syncedTotalCount = 0;
+}
+
 function resetSummaryState(groupId) {
   summaryHistory.groupId = groupId;
   summaryHistory.summaries = [];
@@ -512,13 +545,58 @@ async function loadSelectedGroupDetail(groupId = selectedGroupId.value) {
   if (!groupId) return;
   let detail;
   try {
-    detail = await getGroupDetail(groupId, 500);
+    detail = await getGroupDetail(groupId, 0);
   } catch (error) {
     handleAuthError(error);
     throw error;
   }
   if (selectedGroupId.value === groupId) {
     selectedGroup.value = detail;
+  }
+}
+
+async function loadUnreadMessages({ reset = false, preserve = false } = {}) {
+  const groupId = selectedGroupId.value;
+  if (!groupId || unread.isLoading) return;
+  if (!reset && unread.initialized && !unread.hasMore) return;
+
+  if (reset || unread.groupId !== groupId) {
+    resetUnreadState(groupId);
+  }
+
+  const snapshot = preserve ? unreadPanel.value?.getScrollSnapshot() : null;
+  unread.isLoading = true;
+
+  try {
+    const data = await getUnreadMessages(groupId, {
+      cursor: reset ? null : unread.nextCursor,
+      limit: UNREAD_PAGE_SIZE,
+    });
+    if (selectedGroupId.value !== groupId || unread.groupId !== groupId) return;
+
+    const messages = data.messages || [];
+    unread.totalCount = Number(data.total_count || 0);
+    if (reset) {
+      unread.messages = messages;
+      unread.syncedTotalCount = unread.totalCount;
+    } else {
+      const known = new Set(unread.messages.map((message) => message.message_id));
+      unread.messages = [
+        ...messages.filter((message) => !known.has(message.message_id)),
+        ...unread.messages,
+      ];
+    }
+    unread.nextCursor = data.next_cursor || null;
+    unread.hasMore = Boolean(data.has_more);
+    unread.initialized = true;
+  } finally {
+    unread.isLoading = false;
+    await nextTick();
+    if (reset) {
+      unreadPanel.value?.scrollToBottom();
+    } else if (snapshot) {
+      unreadPanel.value?.preservePosition(snapshot.height, snapshot.top);
+    }
   }
 }
 
@@ -634,15 +712,36 @@ async function appendNewHistoryMessagesIfAtBottom() {
   historyPanel.value?.scrollToBottom();
 }
 
+async function syncUnreadAfterRefresh() {
+  const groupId = selectedGroupId.value;
+  if (!groupId) return;
+  if (!unread.initialized || unread.groupId !== groupId) {
+    await loadUnreadMessages({ reset: true });
+    return;
+  }
+
+  const latestTotal = Number(selectedGroupStats.value.unreadCount || 0);
+  unread.totalCount = latestTotal;
+  if (latestTotal < unread.syncedTotalCount) {
+    await loadUnreadMessages({ reset: true });
+    return;
+  }
+  if (latestTotal > unread.syncedTotalCount && unreadPanel.value?.isNearBottom()) {
+    await loadUnreadMessages({ reset: true });
+  }
+}
+
 async function selectGroup(groupId) {
   selectedGroupId.value = groupId;
   selectedGroup.value = null;
+  resetUnreadState(groupId);
   resetHistoryState(groupId);
   resetSummaryState(groupId);
   setStatus("正在加载群消息...");
 
   try {
     await loadSelectedGroupDetail(groupId);
+    await loadUnreadMessages({ reset: true });
     await loadSummaryHistory({ reset: true });
     await loadHistoryMessages({ reset: true });
     setStatus("");
@@ -653,20 +752,23 @@ async function selectGroup(groupId) {
 
 async function refreshCurrentView({ silent = false, force = false } = {}) {
   if (!auth.checked || !auth.authenticated) return;
-  if (isRefreshing.value || isMutating.value || history.isLoading || (!force && document.hidden)) return;
+  if (isRefreshing.value || isMutating.value || unread.isLoading || history.isLoading || (!force && document.hidden)) return;
   isRefreshing.value = true;
 
   try {
     await loadGroups();
     if (!selectedGroupId.value && groups.value.length) {
       selectedGroupId.value = groups.value[0].group_id;
+      resetUnreadState(selectedGroupId.value);
       resetHistoryState(selectedGroupId.value);
       resetSummaryState(selectedGroupId.value);
       await loadSelectedGroupDetail(selectedGroupId.value);
+      await loadUnreadMessages({ reset: true });
       await loadSummaryHistory({ reset: true });
       await loadHistoryMessages({ reset: true });
     } else if (selectedGroupId.value) {
       await loadSelectedGroupDetail(selectedGroupId.value);
+      await syncUnreadAfterRefresh();
       if (!summaryHistory.initialized || summaryHistory.groupId !== selectedGroupId.value) {
         await loadSummaryHistory({ reset: true });
       }
@@ -689,6 +791,7 @@ async function summarizeSelectedGroup() {
     await summarizeGroup(selectedGroupId.value, 500);
     await loadGroups();
     await loadSelectedGroupDetail(selectedGroupId.value);
+    await loadUnreadMessages({ reset: true });
     await loadSummaryHistory({ reset: true });
     await loadHistoryMessages({ reset: true, date: history.date });
     setStatus("总结完成。", "success");
@@ -709,6 +812,7 @@ async function markSelectedGroupRead() {
     await markGroupRead(selectedGroupId.value);
     await loadGroups();
     await loadSelectedGroupDetail(selectedGroupId.value);
+    await loadUnreadMessages({ reset: true });
     setStatus("已标记为已读。", "success");
   } catch (error) {
     handleAuthError(error);
@@ -747,6 +851,15 @@ async function toggleSelectedGroupAutoSummary() {
 async function loadMoreHistory() {
   try {
     await loadHistoryMessages({ preserve: true });
+  } catch (error) {
+    handleAuthError(error);
+    setStatus(error.message, "error");
+  }
+}
+
+async function loadMoreUnread() {
+  try {
+    await loadUnreadMessages({ preserve: true });
   } catch (error) {
     handleAuthError(error);
     setStatus(error.message, "error");
@@ -815,6 +928,7 @@ async function deleteSelectedHistoryDay() {
     const result = await deleteHistoryDay(selectedGroupId.value, history.date);
     await loadGroups();
     await loadSelectedGroupDetail(selectedGroupId.value);
+    await loadUnreadMessages({ reset: true });
     await loadHistoryMessages({ reset: true, date: history.date });
     setStatus(`已删除 ${history.date} 的 ${result.deleted_count || 0} 条本地历史消息。`, "success");
   } catch (error) {

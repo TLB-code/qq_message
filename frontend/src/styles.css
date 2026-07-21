@@ -663,6 +663,7 @@ button:disabled {
 
 .message-list,
 .summary-list,
+.unread-scroll,
 .history-scroll {
   max-height: calc(100vh - 238px);
   overflow: auto;
@@ -677,28 +678,38 @@ button:disabled {
   padding: 0 12px 12px;
 }
 
-.history-virtual-list {
+.unread-scroll {
+  padding: 0 12px 12px;
+}
+
+.history-virtual-list,
+.unread-virtual-list {
   position: relative;
   width: 100%;
 }
 
 .history-marker-virtual,
-.history-virtual-row {
+.history-virtual-row,
+.unread-marker-virtual,
+.unread-virtual-row {
   position: absolute;
   top: 0;
   right: 0;
   left: 0;
 }
 
-.history-marker-virtual {
+.history-marker-virtual,
+.unread-marker-virtual {
   height: 34px;
 }
 
-.history-virtual-row {
+.history-virtual-row,
+.unread-virtual-row {
   will-change: transform;
 }
 
-.history-virtual-row .message-item {
+.history-virtual-row .message-item,
+.unread-virtual-row .message-item {
   border-bottom: 1px solid #edf2f7;
 }
 

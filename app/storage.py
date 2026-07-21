@@ -411,6 +411,53 @@ class Store:
                 ).fetchall()
             return [dict(row) for row in rows]
 
+    def list_unread_message_page_records(
+        self,
+        group_id: str,
+        limit: int = 100,
+        before_timestamp: int | None = None,
+        before_message_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        limit = max(int(limit), 1)
+        filters = ["m.group_id = ?"]
+        params: list[Any] = [group_id]
+
+        if before_timestamp is not None and before_message_id is not None:
+            filters.append("(m.timestamp < ? OR (m.timestamp = ? AND m.message_id < ?))")
+            params.extend([before_timestamp, before_timestamp, before_message_id])
+
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                SELECT last_message_id, last_timestamp
+                FROM summary_cursors
+                WHERE group_id = ?
+                """,
+                (group_id,),
+            ).fetchone()
+            if cursor is not None and cursor["last_timestamp"] is not None:
+                filters.append(
+                    "(m.timestamp > ? OR (m.timestamp = ? AND m.message_id > ?))"
+                )
+                params.extend([
+                    cursor["last_timestamp"],
+                    cursor["last_timestamp"],
+                    cursor["last_message_id"] or "",
+                ])
+
+            rows = conn.execute(
+                f"""
+                SELECT m.message_id, m.group_id, m.user_id, m.sender_name,
+                       m.content, m.timestamp, m.raw_json
+                FROM messages m
+                WHERE {" AND ".join(filters)}
+                ORDER BY m.timestamp DESC, m.message_id DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+            return [dict(row) for row in reversed(rows)]
+
     def count_unread_message_records(self, group_id: str) -> int:
         with self.connect() as conn:
             row = conn.execute(

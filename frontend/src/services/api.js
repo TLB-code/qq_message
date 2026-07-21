@@ -42,6 +42,16 @@ export function getGroupDetail(groupId, limit = 500) {
   return requestJson(`/api/groups/${encodeURIComponent(groupId)}?limit=${limit}`);
 }
 
+export function getUnreadMessages(groupId, { cursor = null, limit = 100 } = {}) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (cursor) {
+    params.set("before_timestamp", String(cursor.before_timestamp));
+    params.set("before_message_id", String(cursor.before_message_id));
+  }
+
+  return requestJson(`/api/groups/${encodeURIComponent(groupId)}/unread?${params.toString()}`);
+}
+
 export function getSummaries(groupId, { cursor = null, limit = 5, includeTotal = true } = {}) {
   const params = new URLSearchParams({
     limit: String(limit),

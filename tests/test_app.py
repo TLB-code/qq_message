@@ -256,6 +256,48 @@ class AppTests(unittest.TestCase):
 
             self.assertEqual(store.count_unread_message_records("1"), 2)
 
+    def test_store_pages_latest_unread_records_before_cursor(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "test.sqlite3")
+            store.init()
+            store.upsert_group("1", "test group", 100)
+            for index in range(1, 7):
+                store.save_message(
+                    Message(str(index), "1", "u1", "user", f"message {index}", 100 + index),
+                    {"message_id": index},
+                )
+
+            latest = store.list_unread_message_page_records("1", limit=3)
+            older = store.list_unread_message_page_records(
+                "1",
+                limit=3,
+                before_timestamp=latest[0]["timestamp"],
+                before_message_id=latest[0]["message_id"],
+            )
+
+            self.assertEqual([row["message_id"] for row in latest], ["4", "5", "6"])
+            self.assertEqual([row["message_id"] for row in older], ["1", "2", "3"])
+
+    def test_store_unread_page_excludes_summary_cursor_with_message_id_tie_breaker(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "test.sqlite3")
+            store.init()
+            store.upsert_group("1", "test group", 100)
+            messages = [
+                Message(message_id, "1", "u1", "user", message_id, 100)
+                for message_id in ("01", "02", "03", "04")
+            ]
+            for message in messages:
+                store.save_message(message, {"message_id": message.message_id})
+
+            store.save_summary("1", messages[:2], "summary", "test-model", 101)
+
+            page = store.list_unread_message_page_records("1", limit=10)
+            unchanged_summary_order = store.get_unread_message_records("1", limit=10)
+
+            self.assertEqual([row["message_id"] for row in page], ["03", "04"])
+            self.assertEqual([row["message_id"] for row in unchanged_summary_order], ["03", "04"])
+
     def test_store_maintains_cached_group_counts(self):
         with TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "test.sqlite3")

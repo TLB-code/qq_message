@@ -42,6 +42,8 @@ DEFAULT_SUMMARY_LIMIT = 500
 MAX_SUMMARY_LIMIT = 500
 DEFAULT_HISTORY_LIMIT = 50
 MAX_HISTORY_LIMIT = 100
+DEFAULT_UNREAD_LIMIT = 100
+MAX_UNREAD_LIMIT = 100
 DEFAULT_SUMMARY_HISTORY_LIMIT = 5
 MAX_SUMMARY_HISTORY_LIMIT = 20
 MAX_MEDIA_BYTES = 20 * 1024 * 1024
@@ -501,6 +503,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             group_id = group_id[:-1]
 
         if len(parts) == 4:
+            if parts[3] == "unread":
+                self._handle_unread_get(group_id, query)
+                return
             if parts[3] == "history":
                 self._handle_history_get(group_id, query)
                 return
@@ -529,6 +534,57 @@ class RequestHandler(BaseHTTPRequestHandler):
                     for record in STORE.list_recent_message_records(group_id, limit=limit)
                 ],
                 "summaries": STORE.list_summaries(group_id),
+            },
+        )
+
+    def _handle_unread_get(self, group_id: str, query: dict[str, list[str]]) -> None:
+        group = STORE.get_group(group_id)
+        if not group:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Group not found"})
+            return
+
+        try:
+            requested_limit = int((query.get("limit") or [str(DEFAULT_UNREAD_LIMIT)])[0])
+        except (TypeError, ValueError):
+            requested_limit = DEFAULT_UNREAD_LIMIT
+        limit = min(max(requested_limit, 1), MAX_UNREAD_LIMIT)
+
+        before_timestamp: int | None = None
+        before_message_id: str | None = None
+        if query.get("before_timestamp") and query.get("before_message_id"):
+            try:
+                before_timestamp = int(query["before_timestamp"][0])
+                before_message_id = str(query["before_message_id"][0])
+            except (TypeError, ValueError):
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "Invalid unread cursor"})
+                return
+
+        records = STORE.list_unread_message_page_records(
+            group_id,
+            limit=limit + 1,
+            before_timestamp=before_timestamp,
+            before_message_id=before_message_id,
+        )
+        has_more = len(records) > limit
+        records = records[-limit:]
+        messages = [message_payload_from_record(record) for record in records]
+        next_cursor = None
+        if has_more and messages:
+            first = messages[0]
+            next_cursor = {
+                "before_timestamp": first["timestamp"],
+                "before_message_id": first["message_id"],
+            }
+
+        self._json(
+            HTTPStatus.OK,
+            {
+                "group": group,
+                "messages": messages,
+                "total_count": int(group.get("unread_count") or 0),
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+                "limit": limit,
             },
         )
 
