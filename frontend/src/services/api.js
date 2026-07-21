@@ -5,7 +5,23 @@ async function requestJson(url, options = {}) {
     ...options,
   });
   const text = await response.text();
-  const data = text ? JSON.parse(text) : {};
+  let data = {};
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      const responseType = response.headers.get("Content-Type") || "未知类型";
+      const statusText = response.statusText ? ` ${response.statusText}` : "";
+      const error = new Error(
+        response.ok
+          ? `服务器返回了无法识别的响应（${responseType}）`
+          : `请求失败：${response.status}${statusText}，服务器返回了非 JSON 响应`,
+      );
+      error.status = response.status;
+      error.responseText = text.slice(0, 500);
+      throw error;
+    }
+  }
 
   if (!response.ok) {
     const error = new Error(data.error || `请求失败：${response.status}`);
@@ -79,6 +95,16 @@ export function summarizeGroup(groupId, limit = 2000) {
     method: "POST",
     body: JSON.stringify({ limit, mark_read: true }),
   });
+}
+
+export function getSummaryTask(groupId, taskId) {
+  return requestJson(
+    `/api/groups/${encodeURIComponent(groupId)}/summary-tasks/${encodeURIComponent(taskId)}`,
+  );
+}
+
+export function getActiveSummaryTask(groupId) {
+  return requestJson(`/api/groups/${encodeURIComponent(groupId)}/summary-tasks/active`);
 }
 
 export function markGroupRead(groupId) {

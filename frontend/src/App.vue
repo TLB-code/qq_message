@@ -70,7 +70,7 @@
               min="1"
               :max="MANUAL_SUMMARY_MAX"
               :placeholder="String(MANUAL_SUMMARY_MAX)"
-              :disabled="isMutating"
+              :disabled="isMutating || isSummaryRunning"
               aria-label="手动总结消息数量"
               @keydown.enter="summarizeSelectedGroup"
             />
@@ -88,7 +88,7 @@
             class="auto-summary-toggle"
             type="button"
             :class="{ active: selectedGroupAutoSummaryEnabled }"
-            :disabled="!selectedGroupId || isMutating"
+            :disabled="!selectedGroupId || isMutating || isSummaryRunning"
             @click="toggleSelectedGroupAutoSummary"
           >
             <Bot :size="17" />
@@ -276,10 +276,12 @@ import SummaryPanel from "./components/SummaryPanel.vue";
 import UnreadPanel from "./components/UnreadPanel.vue";
 import {
   deleteHistoryDay,
+  getActiveSummaryTask,
   getAuthStatus,
   getGroupDetail,
   getHistory,
   getSummaries,
+  getSummaryTask,
   getUnreadMessages,
   listGroups,
   login,
@@ -352,6 +354,12 @@ const summaryHistory = reactive({
   initialized: false,
   totalCount: 0,
 });
+const summaryTask = reactive({
+  taskId: "",
+  groupId: "",
+  status: "",
+  requestedLimit: 0,
+});
 const layout = reactive({
   sidebarCollapsed: false,
   collapsedPanels: {
@@ -376,6 +384,7 @@ const resizeState = reactive({
 });
 
 let refreshTimer = null;
+let summaryPollGeneration = 0;
 
 const unreadMessages = computed(() => unread.messages);
 const summaries = computed(() => summaryHistory.summaries);
@@ -387,6 +396,7 @@ const selectedGroupStats = computed(() => {
   };
 });
 const unreadTotalCount = computed(() => selectedGroupStats.value.unreadCount ?? unread.totalCount);
+const isSummaryRunning = computed(() => ["queued", "running"].includes(summaryTask.status));
 const summaryTotalCount = computed(() => summaryHistory.totalCount);
 const historyTotalCount = computed(() => {
   if (history.loadedDate) return history.totalCount;
@@ -395,7 +405,12 @@ const historyTotalCount = computed(() => {
 const selectedGroupAutoSummaryEnabled = computed(() =>
   Boolean(selectedGroup.value?.group?.auto_summary_enabled),
 );
-const canMutateUnread = computed(() => Boolean(selectedGroupId.value && unreadTotalCount.value && !isMutating.value));
+const canMutateUnread = computed(() => Boolean(
+  selectedGroupId.value
+    && unreadTotalCount.value
+    && !isMutating.value
+    && !isSummaryRunning.value,
+));
 const canSummarize = computed(() => canMutateUnread.value);
 const hasCollapsedPanels = computed(() => PANEL_IDS.some((id) => layout.collapsedPanels[id]));
 const contentGridStyle = computed(() => ({
@@ -749,6 +764,7 @@ async function syncUnreadAfterRefresh() {
 }
 
 async function selectGroup(groupId) {
+  stopSummaryTaskMonitor();
   selectedGroupId.value = groupId;
   selectedGroup.value = null;
   resetUnreadState(groupId);
@@ -761,6 +777,7 @@ async function selectGroup(groupId) {
     await loadUnreadMessages({ reset: true });
     await loadSummaryHistory({ reset: true });
     await loadHistoryMessages({ reset: true });
+    await resumeActiveSummaryTask(groupId);
     setStatus("");
   } catch (error) {
     setStatus(error.message, "error");
@@ -783,6 +800,7 @@ async function refreshCurrentView({ silent = false, force = false } = {}) {
       await loadUnreadMessages({ reset: true });
       await loadSummaryHistory({ reset: true });
       await loadHistoryMessages({ reset: true });
+      await resumeActiveSummaryTask(selectedGroupId.value);
     } else if (selectedGroupId.value) {
       await loadSelectedGroupDetail(selectedGroupId.value);
       await syncUnreadAfterRefresh();
@@ -799,6 +817,91 @@ async function refreshCurrentView({ silent = false, force = false } = {}) {
   }
 }
 
+function setSummaryTask(task) {
+  summaryTask.taskId = task?.task_id || "";
+  summaryTask.groupId = task?.group_id || "";
+  summaryTask.status = task?.status || "";
+  summaryTask.requestedLimit = Number(task?.requested_limit || 0);
+}
+
+function stopSummaryTaskMonitor() {
+  summaryPollGeneration += 1;
+  setSummaryTask(null);
+}
+
+function waitForSummaryPoll() {
+  return new Promise((resolve) => window.setTimeout(resolve, 2000));
+}
+
+async function reloadAfterSummaryTask(task) {
+  isMutating.value = true;
+  try {
+    await loadGroups();
+    await loadSelectedGroupDetail(task.group_id);
+    await loadUnreadMessages({ reset: true });
+    await loadSummaryHistory({ reset: true });
+    await loadHistoryMessages({ reset: true, date: history.date });
+  } finally {
+    isMutating.value = false;
+  }
+}
+
+async function monitorSummaryTask(initialTask) {
+  if (!initialTask?.task_id) return;
+  const generation = summaryPollGeneration + 1;
+  summaryPollGeneration = generation;
+  let task = initialTask;
+
+  while (generation === summaryPollGeneration && selectedGroupId.value === task.group_id) {
+    setSummaryTask(task);
+    if (task.status === "completed") {
+      try {
+        await reloadAfterSummaryTask(task);
+        if (generation !== summaryPollGeneration) return;
+        setStatus(`已完成 ${task.message_count || task.requested_limit} 条消息的总结。`, "success");
+      } catch (error) {
+        handleAuthError(error);
+        setStatus(error.message, "error");
+      } finally {
+        if (generation === summaryPollGeneration) setSummaryTask(null);
+      }
+      return;
+    }
+    if (task.status === "failed") {
+      setSummaryTask(null);
+      setStatus(`总结失败：${task.error || "后台任务执行失败"}`, "error");
+      return;
+    }
+
+    const expectedCount = Math.min(task.requested_limit || 0, unreadTotalCount.value);
+    setStatus(
+      task.status === "queued"
+        ? `总结任务已进入后台队列，准备处理 ${expectedCount} 条消息...`
+        : `后台正在并行分块总结 ${expectedCount} 条消息...`,
+    );
+    await waitForSummaryPoll();
+    if (generation !== summaryPollGeneration) return;
+
+    try {
+      const data = await getSummaryTask(task.group_id, task.task_id);
+      task = data.task;
+    } catch (error) {
+      handleAuthError(error);
+      if (error?.status === 401) {
+        stopSummaryTaskMonitor();
+        return;
+      }
+      setStatus(`任务状态查询失败，将自动重试：${error.message}`, "error");
+    }
+  }
+}
+
+async function resumeActiveSummaryTask(groupId) {
+  const data = await getActiveSummaryTask(groupId);
+  if (selectedGroupId.value !== groupId || !data.task) return;
+  void monitorSummaryTask(data.task);
+}
+
 async function summarizeSelectedGroup() {
   if (!selectedGroupId.value) return;
   const rawLimit = String(summaryLimitInput.value ?? "").trim();
@@ -810,16 +913,12 @@ async function summarizeSelectedGroup() {
 
   isMutating.value = true;
   const expectedCount = Math.min(limit, unreadTotalCount.value);
-  setStatus(`正在并行分块总结 ${expectedCount} 条消息...`);
+  setStatus(`正在创建 ${expectedCount} 条消息的后台总结任务...`);
 
   try {
     const result = await summarizeGroup(selectedGroupId.value, limit);
-    await loadGroups();
-    await loadSelectedGroupDetail(selectedGroupId.value);
-    await loadUnreadMessages({ reset: true });
-    await loadSummaryHistory({ reset: true });
-    await loadHistoryMessages({ reset: true, date: history.date });
-    setStatus(`已完成 ${result.message_count || expectedCount} 条消息的总结。`, "success");
+    setSummaryTask(result.task);
+    void monitorSummaryTask(result.task);
   } catch (error) {
     handleAuthError(error);
     setStatus(error.message, "error");
@@ -975,6 +1074,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  summaryPollGeneration += 1;
   if (refreshTimer) window.clearInterval(refreshTimer);
   document.removeEventListener("visibilitychange", handleVisibilityChange);
   stopPanelResize();

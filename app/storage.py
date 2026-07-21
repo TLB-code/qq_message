@@ -83,6 +83,28 @@ class Store:
                     created_at INTEGER NOT NULL,
                     FOREIGN KEY (group_id) REFERENCES groups(group_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS summary_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    group_id TEXT NOT NULL,
+                    requested_limit INTEGER NOT NULL,
+                    mark_read INTEGER NOT NULL DEFAULT 1,
+                    status TEXT NOT NULL,
+                    summary_id INTEGER,
+                    message_count INTEGER,
+                    error TEXT,
+                    created_at INTEGER NOT NULL,
+                    started_at INTEGER,
+                    completed_at INTEGER,
+                    FOREIGN KEY (group_id) REFERENCES groups(group_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_summary_tasks_group_created
+                    ON summary_tasks(group_id, created_at DESC);
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_summary_tasks_active_group
+                    ON summary_tasks(group_id)
+                    WHERE status IN ('queued', 'running');
                 """
             )
             group_columns = {
@@ -465,6 +487,135 @@ class Store:
                 (group_id,),
             ).fetchone()
             return int(row["unread_count"] or 0) if row else 0
+
+    def create_summary_task(
+        self,
+        task_id: str,
+        group_id: str,
+        requested_limit: int,
+        mark_read: bool,
+        created_at: int,
+    ) -> tuple[dict[str, Any], bool]:
+        with self.connect() as conn:
+            existing = conn.execute(
+                """
+                SELECT * FROM summary_tasks
+                WHERE group_id = ? AND status IN ('queued', 'running')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (group_id,),
+            ).fetchone()
+            if existing:
+                return dict(existing), False
+
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO summary_tasks (
+                        task_id, group_id, requested_limit, mark_read, status, created_at
+                    ) VALUES (?, ?, ?, ?, 'queued', ?)
+                    """,
+                    (task_id, group_id, requested_limit, int(mark_read), created_at),
+                )
+            except sqlite3.IntegrityError:
+                existing = conn.execute(
+                    """
+                    SELECT * FROM summary_tasks
+                    WHERE group_id = ? AND status IN ('queued', 'running')
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (group_id,),
+                ).fetchone()
+                if existing:
+                    return dict(existing), False
+                raise
+
+            row = conn.execute(
+                "SELECT * FROM summary_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            return dict(row), True
+
+    def get_summary_task(self, task_id: str, group_id: str | None = None) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            if group_id is None:
+                row = conn.execute(
+                    "SELECT * FROM summary_tasks WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM summary_tasks WHERE task_id = ? AND group_id = ?",
+                    (task_id, group_id),
+                ).fetchone()
+            return dict(row) if row else None
+
+    def get_active_summary_task(self, group_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM summary_tasks
+                WHERE group_id = ? AND status IN ('queued', 'running')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (group_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def mark_summary_task_running(self, task_id: str, started_at: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE summary_tasks
+                SET status = 'running', started_at = ?, error = NULL
+                WHERE task_id = ? AND status = 'queued'
+                """,
+                (started_at, task_id),
+            )
+
+    def complete_summary_task(
+        self,
+        task_id: str,
+        summary_id: int,
+        message_count: int,
+        completed_at: int,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE summary_tasks
+                SET status = 'completed', summary_id = ?, message_count = ?,
+                    error = NULL, completed_at = ?
+                WHERE task_id = ?
+                """,
+                (summary_id, message_count, completed_at, task_id),
+            )
+
+    def fail_summary_task(self, task_id: str, error: str, completed_at: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE summary_tasks
+                SET status = 'failed', error = ?, completed_at = ?
+                WHERE task_id = ?
+                """,
+                (error, completed_at, task_id),
+            )
+
+    def fail_interrupted_summary_tasks(self, completed_at: int) -> int:
+        with self.connect() as conn:
+            result = conn.execute(
+                """
+                UPDATE summary_tasks
+                SET status = 'failed', error = '服务在任务完成前重启', completed_at = ?
+                WHERE status IN ('queued', 'running')
+                """,
+                (completed_at,),
+            )
+            return result.rowcount
 
     def list_recent_messages(self, group_id: str, limit: int = 50) -> list[Message]:
         with self.connect() as conn:

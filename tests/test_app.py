@@ -17,6 +17,7 @@ from app.server import (
     media_proxy_url,
     message_payload_from_record,
     parse_manual_summary_limit,
+    process_manual_summary_task,
     query_bool,
     revoke_web_session,
     summarize_group_messages,
@@ -259,6 +260,74 @@ class AppTests(unittest.TestCase):
             store.save_summary("1", first_two, "summary", "test-model", 200)
 
             self.assertEqual(store.count_unread_message_records("1"), 2)
+
+    def test_store_tracks_async_summary_task_lifecycle(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "test.sqlite3")
+            store.init()
+            store.upsert_group("1", "test group", 100)
+
+            task, created = store.create_summary_task("task-1", "1", 1000, True, 101)
+            duplicate, duplicate_created = store.create_summary_task("task-2", "1", 500, True, 102)
+
+            self.assertTrue(created)
+            self.assertEqual(task["status"], "queued")
+            self.assertFalse(duplicate_created)
+            self.assertEqual(duplicate["task_id"], "task-1")
+            self.assertEqual(store.get_active_summary_task("1")["task_id"], "task-1")
+
+            store.mark_summary_task_running("task-1", 103)
+            store.complete_summary_task("task-1", summary_id=7, message_count=321, completed_at=104)
+            completed = store.get_summary_task("task-1", group_id="1")
+
+            self.assertEqual(completed["status"], "completed")
+            self.assertEqual(completed["summary_id"], 7)
+            self.assertEqual(completed["message_count"], 321)
+            self.assertIsNone(store.get_active_summary_task("1"))
+
+    def test_store_marks_interrupted_summary_tasks_failed(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "test.sqlite3")
+            store.init()
+            store.upsert_group("1", "test group", 100)
+            store.create_summary_task("task-1", "1", 1000, True, 101)
+            store.mark_summary_task_running("task-1", 102)
+
+            count = store.fail_interrupted_summary_tasks(103)
+            task = store.get_summary_task("task-1")
+
+            self.assertEqual(count, 1)
+            self.assertEqual(task["status"], "failed")
+            self.assertIn("重启", task["error"])
+
+    def test_manual_summary_task_completes_in_background_processor(self):
+        import app.server as server
+
+        with TemporaryDirectory() as tmp:
+            original_store = server.STORE
+            store = Store(Path(tmp) / "test.sqlite3")
+            store.init()
+            store.upsert_group("1", "test group", 100)
+            store.save_message(
+                Message("1", "1", "u1", "user", "[图片:pic.jpg]", 100),
+                {
+                    "message_id": "1",
+                    "raw_message": "[CQ:image,file=pic.jpg]",
+                    "message": None,
+                },
+            )
+            store.create_summary_task("task-1", "1", 1000, True, 101)
+
+            try:
+                server.STORE = store
+                task = process_manual_summary_task("task-1")
+            finally:
+                server.STORE = original_store
+
+            self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["message_count"], 1)
+            self.assertIsNotNone(task["summary_id"])
+            self.assertEqual(store.count_unread_message_records("1"), 0)
 
     def test_store_pages_latest_unread_records_before_cursor(self):
         with TemporaryDirectory() as tmp:

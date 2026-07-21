@@ -61,6 +61,8 @@ AUTO_SUMMARY_QUEUE: queue.Queue[str] = queue.Queue()
 AUTO_SUMMARY_QUEUED_GROUPS: set[str] = set()
 AUTO_SUMMARY_QUEUE_LOCK = threading.Lock()
 AUTO_SUMMARY_WORKER_STARTED = False
+MANUAL_SUMMARY_QUEUE: queue.Queue[str] = queue.Queue()
+MANUAL_SUMMARY_WORKER_STARTED = False
 SUMMARY_LOCKS: dict[str, threading.Lock] = {}
 SUMMARY_LOCKS_LOCK = threading.Lock()
 WEB_SESSION_COOKIE = "qq_summary_session"
@@ -178,6 +180,21 @@ def parse_manual_summary_limit(value: object) -> int:
     if not 1 <= limit <= MAX_SUMMARY_LIMIT:
         raise ValueError(f"Summary limit must be an integer from 1 to {MAX_SUMMARY_LIMIT}")
     return limit
+
+
+def summary_task_payload(task: dict) -> dict:
+    return {
+        "task_id": str(task["task_id"]),
+        "group_id": str(task["group_id"]),
+        "requested_limit": int(task["requested_limit"]),
+        "status": str(task["status"]),
+        "summary_id": task.get("summary_id"),
+        "message_count": task.get("message_count"),
+        "error": task.get("error"),
+        "created_at": int(task["created_at"]),
+        "started_at": task.get("started_at"),
+        "completed_at": task.get("completed_at"),
+    }
 
 
 def web_auth_enabled() -> bool:
@@ -319,6 +336,50 @@ def start_auto_summary_worker() -> None:
         return
     AUTO_SUMMARY_WORKER_STARTED = True
     worker = threading.Thread(target=auto_summary_worker, name="auto-summary-worker", daemon=True)
+    worker.start()
+
+
+def process_manual_summary_task(task_id: str) -> dict | None:
+    task = STORE.get_summary_task(task_id)
+    if not task or task["status"] != "queued":
+        return task
+
+    try:
+        STORE.mark_summary_task_running(task_id, int(time.time()))
+        lock = summary_lock_for_group(str(task["group_id"]))
+        with lock:
+            result = summarize_group_messages(
+                str(task["group_id"]),
+                limit=int(task["requested_limit"]),
+                mark_read=bool(task["mark_read"]),
+            )
+        STORE.complete_summary_task(
+            task_id,
+            summary_id=int(result["summary_id"]),
+            message_count=int(result["message_count"]),
+            completed_at=int(time.time()),
+        )
+    except Exception as exc:
+        STORE.fail_summary_task(task_id, str(exc), int(time.time()))
+        print(f"Manual summary task {task_id} failed: {exc}")
+    return STORE.get_summary_task(task_id)
+
+
+def manual_summary_worker() -> None:
+    while True:
+        task_id = MANUAL_SUMMARY_QUEUE.get()
+        try:
+            process_manual_summary_task(task_id)
+        finally:
+            MANUAL_SUMMARY_QUEUE.task_done()
+
+
+def start_manual_summary_worker() -> None:
+    global MANUAL_SUMMARY_WORKER_STARTED
+    if MANUAL_SUMMARY_WORKER_STARTED:
+        return
+    MANUAL_SUMMARY_WORKER_STARTED = True
+    worker = threading.Thread(target=manual_summary_worker, name="manual-summary-worker", daemon=True)
     worker.start()
 
 
@@ -511,13 +572,20 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _handle_group_get(self, path: str, query: dict[str, list[str]]) -> None:
         parts = path.strip("/").split("/")
-        if len(parts) not in (3, 4) or parts[0] != "api" or parts[1] != "groups":
+        if len(parts) not in (3, 4, 5) or parts[0] != "api" or parts[1] != "groups":
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
             return
 
         group_id = parts[2]
         if group_id.endswith("/"):
             group_id = group_id[:-1]
+
+        if len(parts) == 5:
+            if parts[3] == "summary-tasks":
+                self._handle_summary_task_get(group_id, parts[4])
+                return
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+            return
 
         if len(parts) == 4:
             if parts[3] == "unread":
@@ -553,6 +621,25 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "summaries": STORE.list_summaries(group_id),
             },
         )
+
+    def _handle_summary_task_get(self, group_id: str, task_id: str) -> None:
+        if not STORE.get_group(group_id):
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Group not found"})
+            return
+
+        if task_id == "active":
+            task = STORE.get_active_summary_task(group_id)
+            self._json(
+                HTTPStatus.OK,
+                {"task": summary_task_payload(task) if task else None},
+            )
+            return
+
+        task = STORE.get_summary_task(task_id, group_id=group_id)
+        if not task:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Summary task not found"})
+            return
+        self._json(HTTPStatus.OK, {"task": summary_task_payload(task)})
 
     def _handle_unread_get(self, group_id: str, query: dict[str, list[str]]) -> None:
         group = STORE.get_group(group_id)
@@ -828,23 +915,29 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         mark_read = bool(body.get("mark_read", True))
 
-        lock = summary_lock_for_group(group_id)
-        with lock:
-            try:
-                result = summarize_group_messages(group_id, limit=limit, mark_read=mark_read)
-            except ValueError as exc:
-                status = HTTPStatus.NOT_FOUND if str(exc) == "Group not found" else HTTPStatus.BAD_REQUEST
-                self._json(status, {"error": str(exc)})
-                return
-            except SummarizerError as exc:
-                self._json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
-                return
+        if not STORE.get_group(group_id):
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Group not found"})
+            return
+        if STORE.count_unread_message_records(group_id) <= 0:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "No unread messages to summarize"})
+            return
+
+        task, created = STORE.create_summary_task(
+            task_id=secrets.token_urlsafe(18),
+            group_id=group_id,
+            requested_limit=limit,
+            mark_read=mark_read,
+            created_at=int(time.time()),
+        )
+        if created:
+            MANUAL_SUMMARY_QUEUE.put(str(task["task_id"]))
 
         self._json(
-            HTTPStatus.OK,
+            HTTPStatus.ACCEPTED,
             {
                 "ok": True,
-                **result,
+                "created": created,
+                "task": summary_task_payload(task),
             },
         )
 
@@ -971,7 +1064,9 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 def run() -> None:
     STORE.init()
+    interrupted_task_count = STORE.fail_interrupted_summary_tasks(int(time.time()))
     start_auto_summary_worker()
+    start_manual_summary_worker()
     refresh_count = refresh_stored_cq_messages()
     auto_summary_count = enqueue_existing_auto_summaries()
     address = (SETTINGS.host, SETTINGS.port)
@@ -989,6 +1084,8 @@ def run() -> None:
         print(f"Refreshed {refresh_count} stored CQ messages")
     if auto_summary_count:
         print(f"Queued {auto_summary_count} group(s) for automatic summary")
+    if interrupted_task_count:
+        print(f"Marked {interrupted_task_count} interrupted manual summary task(s) as failed")
     httpd.serve_forever()
 
 
