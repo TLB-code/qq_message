@@ -74,7 +74,7 @@ export function markSummaryRead(groupId, summaryId) {
   );
 }
 
-export function summarizeGroup(groupId, limit = 500) {
+export function summarizeGroup(groupId, limit = 2000) {
   return requestJson(`/api/groups/${encodeURIComponent(groupId)}/summarize`, {
     method: "POST",
     body: JSON.stringify({ limit, mark_read: true }),

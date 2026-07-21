@@ -1,9 +1,12 @@
 import unittest
+import threading
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from app.onebot import message_display_parts, message_to_summary_text, parse_group_message
 from app.server import (
+    AUTO_SUMMARY_BATCH_LIMIT,
     DEFAULT_SUMMARY_LIMIT,
     MEDIA_ONLY_SUMMARY,
     MAX_SUMMARY_LIMIT,
@@ -13,6 +16,7 @@ from app.server import (
     is_allowed_media_url,
     media_proxy_url,
     message_payload_from_record,
+    parse_manual_summary_limit,
     query_bool,
     revoke_web_session,
     summarize_group_messages,
@@ -642,8 +646,20 @@ class AppTests(unittest.TestCase):
         self.assertIn("魔女公主♪ 专属", prompt[-1]["content"])
 
     def test_summary_limit_is_one_batch(self):
-        self.assertEqual(DEFAULT_SUMMARY_LIMIT, 500)
-        self.assertEqual(MAX_SUMMARY_LIMIT, 500)
+        self.assertEqual(DEFAULT_SUMMARY_LIMIT, 2000)
+        self.assertEqual(MAX_SUMMARY_LIMIT, 2000)
+        self.assertEqual(AUTO_SUMMARY_BATCH_LIMIT, 500)
+
+    def test_manual_summary_limit_defaults_and_validates_range(self):
+        self.assertEqual(parse_manual_summary_limit(None), 2000)
+        self.assertEqual(parse_manual_summary_limit(""), 2000)
+        self.assertEqual(parse_manual_summary_limit("1500"), 1500)
+        with self.assertRaises(ValueError):
+            parse_manual_summary_limit(0)
+        with self.assertRaises(ValueError):
+            parse_manual_summary_limit(2001)
+        with self.assertRaises(ValueError):
+            parse_manual_summary_limit("1.5")
 
     def test_split_messages_preserves_order(self):
         messages = [
@@ -669,9 +685,9 @@ class AppTests(unittest.TestCase):
 
             def _chat(self, messages):
                 self.calls.append(messages)
-                if len(self.calls) == 4:
+                if "合并为最终总结" in messages[-1]["content"]:
                     return "final summary"
-                return f"chunk summary {len(self.calls)}"
+                return "chunk summary"
 
         messages = [
             Message(str(i), "1", "u", "user", f"message {i}", 1718000000 + i)
@@ -684,6 +700,47 @@ class AppTests(unittest.TestCase):
         self.assertEqual(summary, "final summary")
         self.assertEqual(len(client.calls), 4)
         self.assertEqual(client.calls[-1][0]["role"], "system")
+
+    def test_deepseek_client_summarizes_chunks_in_parallel(self):
+        class ParallelFakeClient(DeepSeekClient):
+            def __init__(self):
+                super().__init__(
+                    api_key="test",
+                    chunk_max_messages=1,
+                    chunk_max_chars=1000,
+                    merge_max_blocks=10,
+                    merge_max_chars=10000,
+                    chunk_parallelism=3,
+                )
+                self.lock = threading.Lock()
+                self.active_chunk_calls = 0
+                self.max_active_chunk_calls = 0
+
+            def _chat(self, messages):
+                content = messages[-1]["content"]
+                if "合并为最终总结" in content:
+                    return "final summary"
+                with self.lock:
+                    self.active_chunk_calls += 1
+                    self.max_active_chunk_calls = max(
+                        self.max_active_chunk_calls,
+                        self.active_chunk_calls,
+                    )
+                time.sleep(0.05)
+                with self.lock:
+                    self.active_chunk_calls -= 1
+                return "chunk summary"
+
+        messages = [
+            Message(str(i), "1", "u", "user", f"message {i}", 1718000000 + i)
+            for i in range(3)
+        ]
+        client = ParallelFakeClient()
+
+        summary = client.summarize("test group", messages)
+
+        self.assertEqual(summary, "final summary")
+        self.assertGreaterEqual(client.max_active_chunk_calls, 2)
 
 
 if __name__ == "__main__":

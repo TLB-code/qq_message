@@ -441,6 +441,34 @@ button:disabled {
   gap: 8px;
 }
 
+.summary-limit-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--muted-strong);
+  padding: 0 10px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.summary-limit-field:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.summary-limit-field input {
+  width: 72px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: right;
+}
+
 .primary-button {
   border-color: var(--accent);
   background: var(--accent);
@@ -1257,8 +1285,13 @@ button:disabled {
   }
 
   .topbar-actions,
-  .topbar-actions button {
+  .topbar-actions button,
+  .summary-limit-field {
     width: 100%;
+  }
+
+  .summary-limit-field input {
+    flex: 1;
   }
 
   .history-tools {

@@ -61,6 +61,21 @@
           </p>
         </div>
         <div class="topbar-actions">
+          <label class="summary-limit-field">
+            <span>总结数量</span>
+            <input
+              v-model="summaryLimitInput"
+              type="number"
+              inputmode="numeric"
+              min="1"
+              :max="MANUAL_SUMMARY_MAX"
+              :placeholder="String(MANUAL_SUMMARY_MAX)"
+              :disabled="isMutating"
+              aria-label="手动总结消息数量"
+              @keydown.enter="summarizeSelectedGroup"
+            />
+            <span>条</span>
+          </label>
           <button class="primary-button" type="button" :disabled="!canSummarize" @click="summarizeSelectedGroup">
             <Sparkles :size="17" />
             <span>总结未读</span>
@@ -276,6 +291,7 @@ import {
 import { formatFullTime } from "./utils/format";
 
 const AUTO_REFRESH_INTERVAL_MS = 3000;
+const MANUAL_SUMMARY_MAX = 2000;
 const UNREAD_PAGE_SIZE = 100;
 const HISTORY_PAGE_SIZE = 50;
 const SUMMARY_PAGE_SIZE = 5;
@@ -293,6 +309,7 @@ const selectedGroup = ref(null);
 const markingSummaryReadIds = ref([]);
 const isRefreshing = ref(false);
 const isMutating = ref(false);
+const summaryLimitInput = ref("");
 const unreadPanel = ref(null);
 const historyPanel = ref(null);
 const panelGrid = ref(null);
@@ -784,17 +801,25 @@ async function refreshCurrentView({ silent = false, force = false } = {}) {
 
 async function summarizeSelectedGroup() {
   if (!selectedGroupId.value) return;
+  const rawLimit = String(summaryLimitInput.value ?? "").trim();
+  const limit = rawLimit === "" ? MANUAL_SUMMARY_MAX : Number(rawLimit);
+  if (!Number.isInteger(limit) || limit < 1 || limit > MANUAL_SUMMARY_MAX) {
+    setStatus(`总结数量必须是 1 到 ${MANUAL_SUMMARY_MAX} 之间的整数。`, "error");
+    return;
+  }
+
   isMutating.value = true;
-  setStatus("正在调用 DeepSeek 总结，当前批次最多 500 条...");
+  const expectedCount = Math.min(limit, unreadTotalCount.value);
+  setStatus(`正在并行分块总结 ${expectedCount} 条消息...`);
 
   try {
-    await summarizeGroup(selectedGroupId.value, 500);
+    const result = await summarizeGroup(selectedGroupId.value, limit);
     await loadGroups();
     await loadSelectedGroupDetail(selectedGroupId.value);
     await loadUnreadMessages({ reset: true });
     await loadSummaryHistory({ reset: true });
     await loadHistoryMessages({ reset: true, date: history.date });
-    setStatus("总结完成。", "success");
+    setStatus(`已完成 ${result.message_count || expectedCount} 条消息的总结。`, "success");
   } catch (error) {
     handleAuthError(error);
     setStatus(error.message, "error");

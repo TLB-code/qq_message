@@ -38,8 +38,9 @@ SUMMARIZER = DeepSeekClient(
 )
 STATIC_DIR = BASE_DIR / "frontend" / "dist"
 WEBHOOK_LOG_PATH = SETTINGS.database_path.parent / "webhook_events.log"
-DEFAULT_SUMMARY_LIMIT = 500
-MAX_SUMMARY_LIMIT = 500
+DEFAULT_SUMMARY_LIMIT = 2000
+MAX_SUMMARY_LIMIT = 2000
+AUTO_SUMMARY_BATCH_LIMIT = 500
 DEFAULT_HISTORY_LIMIT = 50
 MAX_HISTORY_LIMIT = 100
 DEFAULT_UNREAD_LIMIT = 100
@@ -163,6 +164,22 @@ def query_bool(query: dict[str, list[str]], name: str, default: bool = False) ->
     return values[0].strip().lower() in {"1", "true", "yes", "on"}
 
 
+def parse_manual_summary_limit(value: object) -> int:
+    if value is None or value == "":
+        return DEFAULT_SUMMARY_LIMIT
+    if isinstance(value, bool):
+        raise ValueError(f"Summary limit must be an integer from 1 to {MAX_SUMMARY_LIMIT}")
+    try:
+        limit = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Summary limit must be an integer from 1 to {MAX_SUMMARY_LIMIT}") from exc
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(f"Summary limit must be an integer from 1 to {MAX_SUMMARY_LIMIT}")
+    if not 1 <= limit <= MAX_SUMMARY_LIMIT:
+        raise ValueError(f"Summary limit must be an integer from 1 to {MAX_SUMMARY_LIMIT}")
+    return limit
+
+
 def web_auth_enabled() -> bool:
     return bool(SETTINGS.web_password)
 
@@ -273,7 +290,7 @@ def auto_summary_worker() -> None:
                     try:
                         result = summarize_group_messages(
                             group_id,
-                            limit=SETTINGS.auto_summary_threshold,
+                            limit=AUTO_SUMMARY_BATCH_LIMIT,
                             mark_read=True,
                         )
                     except SummarizerError as exc:
@@ -805,10 +822,10 @@ class RequestHandler(BaseHTTPRequestHandler):
     def _summarize_group(self, group_id: str) -> None:
         body = self._read_json(default={})
         try:
-            requested_limit = int(body.get("limit", DEFAULT_SUMMARY_LIMIT))
-        except (TypeError, ValueError):
-            requested_limit = DEFAULT_SUMMARY_LIMIT
-        limit = min(max(requested_limit, 1), MAX_SUMMARY_LIMIT)
+            limit = parse_manual_summary_limit(body.get("limit"))
+        except ValueError as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
         mark_read = bool(body.get("mark_read", True))
 
         lock = summary_lock_for_group(group_id)

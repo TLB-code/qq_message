@@ -5,6 +5,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -17,6 +18,7 @@ CHUNK_MAX_MESSAGES = 250
 CHUNK_MAX_CHARS = 12000
 MERGE_MAX_BLOCKS = 12
 MERGE_MAX_CHARS = 18000
+CHUNK_PARALLELISM = 4
 SPECIAL_MEMBER_NAME = "魔女公主♪"
 
 
@@ -314,6 +316,7 @@ class DeepSeekClient:
         chunk_max_chars: int = CHUNK_MAX_CHARS,
         merge_max_blocks: int = MERGE_MAX_BLOCKS,
         merge_max_chars: int = MERGE_MAX_CHARS,
+        chunk_parallelism: int = CHUNK_PARALLELISM,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -324,6 +327,7 @@ class DeepSeekClient:
         self.chunk_max_chars = chunk_max_chars
         self.merge_max_blocks = merge_max_blocks
         self.merge_max_chars = merge_max_chars
+        self.chunk_parallelism = max(int(chunk_parallelism), 1)
 
     def summarize(self, group_name: str, messages: list[Message]) -> str:
         if not self.api_key:
@@ -358,8 +362,8 @@ class DeepSeekClient:
                 )
             )
 
-        blocks: list[SummaryBlock] = []
-        for index, chunk in enumerate(chunks, start=1):
+        def summarize_chunk(item: tuple[int, list[Message]]) -> SummaryBlock:
+            index, chunk = item
             chunk_summary = self._chat(
                 build_chunk_summary_prompt(
                     group_name,
@@ -369,14 +373,17 @@ class DeepSeekClient:
                     max_chars=self.chunk_max_chars,
                 )
             )
-            blocks.append(
-                SummaryBlock(
-                    title=f"第 {index}/{len(chunks)} 块",
-                    message_count=len(chunk),
-                    time_range=_message_time_range(chunk),
-                    content=chunk_summary,
-                )
+            return SummaryBlock(
+                title=f"第 {index}/{len(chunks)} 块",
+                message_count=len(chunk),
+                time_range=_message_time_range(chunk),
+                content=chunk_summary,
             )
+
+        indexed_chunks = list(enumerate(chunks, start=1))
+        worker_count = min(self.chunk_parallelism, len(indexed_chunks))
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="summary-chunk") as executor:
+            blocks = list(executor.map(summarize_chunk, indexed_chunks))
 
         return self._merge_summary_blocks(
             group_name=group_name,
