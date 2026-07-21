@@ -101,6 +101,10 @@
         <Info v-if="status.type !== 'error'" :size="17" />
         <CircleAlert v-else :size="17" />
         <span>{{ status.message }}</span>
+        <div v-if="isSummaryRunning && summaryTask.totalChunks" class="summary-task-progress">
+          <progress :value="summaryProgressPercent" max="100" />
+          <strong>{{ summaryProgressPercent }}%</strong>
+        </div>
       </div>
 
       <section class="overview-strip">
@@ -293,7 +297,7 @@ import {
 import { formatFullTime } from "./utils/format";
 
 const AUTO_REFRESH_INTERVAL_MS = 3000;
-const MANUAL_SUMMARY_MAX = 2000;
+const MANUAL_SUMMARY_MAX = 5000;
 const UNREAD_PAGE_SIZE = 100;
 const HISTORY_PAGE_SIZE = 50;
 const SUMMARY_PAGE_SIZE = 5;
@@ -358,7 +362,11 @@ const summaryTask = reactive({
   taskId: "",
   groupId: "",
   status: "",
+  stage: "",
   requestedLimit: 0,
+  totalMessages: 0,
+  totalChunks: 0,
+  completedChunks: 0,
 });
 const layout = reactive({
   sidebarCollapsed: false,
@@ -397,6 +405,10 @@ const selectedGroupStats = computed(() => {
 });
 const unreadTotalCount = computed(() => selectedGroupStats.value.unreadCount ?? unread.totalCount);
 const isSummaryRunning = computed(() => ["queued", "running"].includes(summaryTask.status));
+const summaryProgressPercent = computed(() => {
+  if (!summaryTask.totalChunks) return 0;
+  return Math.min(Math.round((summaryTask.completedChunks / summaryTask.totalChunks) * 100), 100);
+});
 const summaryTotalCount = computed(() => summaryHistory.totalCount);
 const historyTotalCount = computed(() => {
   if (history.loadedDate) return history.totalCount;
@@ -821,7 +833,11 @@ function setSummaryTask(task) {
   summaryTask.taskId = task?.task_id || "";
   summaryTask.groupId = task?.group_id || "";
   summaryTask.status = task?.status || "";
+  summaryTask.stage = task?.stage || "";
   summaryTask.requestedLimit = Number(task?.requested_limit || 0);
+  summaryTask.totalMessages = Number(task?.total_messages || 0);
+  summaryTask.totalChunks = Number(task?.total_chunks || 0);
+  summaryTask.completedChunks = Number(task?.completed_chunks || 0);
 }
 
 function stopSummaryTaskMonitor() {
@@ -873,12 +889,22 @@ async function monitorSummaryTask(initialTask) {
       return;
     }
 
-    const expectedCount = Math.min(task.requested_limit || 0, unreadTotalCount.value);
-    setStatus(
-      task.status === "queued"
-        ? `总结任务已进入后台队列，准备处理 ${expectedCount} 条消息...`
-        : `后台正在并行分块总结 ${expectedCount} 条消息...`,
-    );
+    const expectedCount = task.total_messages
+      || Math.min(task.requested_limit || 0, unreadTotalCount.value);
+    if (task.status === "queued") {
+      setStatus(`总结任务已进入后台队列，准备处理 ${expectedCount} 条消息...`);
+    } else if (task.stage === "merging") {
+      setStatus(`全部 ${task.total_chunks} 个分块已完成，正在合并最终总结...`);
+    } else if (task.stage === "saving") {
+      setStatus("最终总结已生成，正在保存结果...");
+    } else if (task.total_chunks) {
+      setStatus(
+        `后台正在并行分块总结 ${expectedCount} 条消息：`
+        + `${task.completed_chunks}/${task.total_chunks} 块已完成。`,
+      );
+    } else {
+      setStatus(`正在固定 ${expectedCount} 条消息范围并生成分块计划...`);
+    }
     await waitForSummaryPoll();
     if (generation !== summaryPollGeneration) return;
 

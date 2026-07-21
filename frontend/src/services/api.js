@@ -90,7 +90,7 @@ export function markSummaryRead(groupId, summaryId) {
   );
 }
 
-export function summarizeGroup(groupId, limit = 2000) {
+export function summarizeGroup(groupId, limit = 5000) {
   return requestJson(`/api/groups/${encodeURIComponent(groupId)}/summarize`, {
     method: "POST",
     body: JSON.stringify({ limit, mark_read: true }),

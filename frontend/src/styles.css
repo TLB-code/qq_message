@@ -501,6 +501,32 @@ button:disabled {
   font-size: 13px;
 }
 
+.status-bar > span {
+  min-width: 0;
+  flex: 1;
+}
+
+.summary-task-progress {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.summary-task-progress progress {
+  width: 120px;
+  height: 8px;
+  border: 0;
+  border-radius: 4px;
+  overflow: hidden;
+  accent-color: var(--accent);
+}
+
+.summary-task-progress strong {
+  min-width: 34px;
+  text-align: right;
+}
+
 .status-bar.error {
   border-color: #efb6b6;
   background: var(--danger-soft);
@@ -1291,6 +1317,19 @@ button:disabled {
   }
 
   .summary-limit-field input {
+    flex: 1;
+  }
+
+  .status-bar {
+    flex-wrap: wrap;
+  }
+
+  .summary-task-progress {
+    width: 100%;
+    padding-left: 25px;
+  }
+
+  .summary-task-progress progress {
     flex: 1;
   }
 

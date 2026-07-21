@@ -285,20 +285,32 @@ class AppTests(unittest.TestCase):
             self.assertEqual(completed["message_count"], 321)
             self.assertIsNone(store.get_active_summary_task("1"))
 
-    def test_store_marks_interrupted_summary_tasks_failed(self):
+    def test_store_requeues_interrupted_summary_tasks_with_checkpoints(self):
         with TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "test.sqlite3")
             store.init()
             store.upsert_group("1", "test group", 100)
             store.create_summary_task("task-1", "1", 1000, True, 101)
             store.mark_summary_task_running("task-1", 102)
+            store.set_summary_task_plan("task-1", 3)
+            store.save_summary_task_chunk(
+                "task-1",
+                chunk_index=1,
+                title="chunk 1",
+                message_count=2,
+                time_range="time",
+                summary="saved chunk",
+                completed_at=102,
+            )
 
-            count = store.fail_interrupted_summary_tasks(103)
+            task_ids = store.requeue_interrupted_summary_tasks()
             task = store.get_summary_task("task-1")
 
-            self.assertEqual(count, 1)
-            self.assertEqual(task["status"], "failed")
-            self.assertIn("重启", task["error"])
+            self.assertEqual(task_ids, ["task-1"])
+            self.assertEqual(task["status"], "queued")
+            self.assertEqual(task["stage"], "resuming")
+            self.assertEqual(task["completed_chunks"], 1)
+            self.assertEqual(len(store.list_summary_task_chunks("task-1")), 1)
 
     def test_manual_summary_task_completes_in_background_processor(self):
         import app.server as server
@@ -328,6 +340,69 @@ class AppTests(unittest.TestCase):
             self.assertEqual(task["message_count"], 1)
             self.assertIsNotNone(task["summary_id"])
             self.assertEqual(store.count_unread_message_records("1"), 0)
+
+    def test_manual_summary_task_resumes_without_repeating_saved_chunks(self):
+        import app.server as server
+
+        class ResumeFakeClient(DeepSeekClient):
+            def __init__(self):
+                super().__init__(
+                    api_key="test",
+                    chunk_max_messages=2,
+                    chunk_max_chars=1000,
+                    merge_max_blocks=10,
+                    merge_max_chars=10000,
+                    chunk_parallelism=2,
+                )
+                self.chunk_calls = []
+
+            def _chat(self, messages):
+                content = messages[-1]["content"]
+                if "合并为最终总结" in content:
+                    return "resumed final summary"
+                self.chunk_calls.append(content)
+                return "new chunk summary"
+
+        with TemporaryDirectory() as tmp:
+            original_store = server.STORE
+            original_summarizer = server.SUMMARIZER
+            store = Store(Path(tmp) / "test.sqlite3")
+            store.init()
+            store.upsert_group("1", "test group", 100)
+            records = []
+            for index in range(5):
+                message = Message(str(index), "1", "u1", "user", f"message {index}", 100 + index)
+                store.save_message(message, {"message_id": index})
+            records = store.get_unread_message_records("1", limit=5)
+            store.create_summary_task("task-1", "1", 5000, True, 105)
+            store.mark_summary_task_running("task-1", 106)
+            store.save_summary_task_message_snapshot("task-1", records)
+            store.set_summary_task_plan("task-1", 3)
+            store.save_summary_task_chunk(
+                "task-1",
+                chunk_index=1,
+                title="第 1/3 块",
+                message_count=2,
+                time_range="06-10 00:00 - 06-10 00:01",
+                summary="saved chunk summary",
+                completed_at=107,
+            )
+            store.requeue_interrupted_summary_tasks()
+            client = ResumeFakeClient()
+
+            try:
+                server.STORE = store
+                server.SUMMARIZER = client
+                task = process_manual_summary_task("task-1")
+            finally:
+                server.STORE = original_store
+                server.SUMMARIZER = original_summarizer
+
+            self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["completed_chunks"], 3)
+            self.assertEqual(len(client.chunk_calls), 2)
+            self.assertFalse(any("第 1/3 块" in prompt for prompt in client.chunk_calls))
+            self.assertEqual(store.list_summaries("1", limit=1)[0]["summary"], "resumed final summary")
 
     def test_store_pages_latest_unread_records_before_cursor(self):
         with TemporaryDirectory() as tmp:
@@ -465,6 +540,38 @@ class AppTests(unittest.TestCase):
             self.assertEqual(group["unread_count"], 2)
             self.assertEqual(group["latest_timestamp"], 102)
             self.assertEqual(store.list_groups()[0]["message_count"], 3)
+
+    def test_store_migrates_existing_summary_task_progress_columns(self):
+        with TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "test.sqlite3"
+            store = Store(database_path)
+            with store.connect() as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE summary_tasks (
+                        task_id TEXT PRIMARY KEY,
+                        group_id TEXT NOT NULL,
+                        requested_limit INTEGER NOT NULL,
+                        mark_read INTEGER NOT NULL DEFAULT 1,
+                        status TEXT NOT NULL,
+                        summary_id INTEGER,
+                        message_count INTEGER,
+                        error TEXT,
+                        created_at INTEGER NOT NULL,
+                        started_at INTEGER,
+                        completed_at INTEGER
+                    );
+                    """
+                )
+
+            store.init()
+
+            with store.connect() as conn:
+                columns = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(summary_tasks)").fetchall()
+                }
+            self.assertTrue({"stage", "total_messages", "total_chunks", "completed_chunks"} <= columns)
 
     def test_store_group_auto_summary_defaults_off_and_can_toggle(self):
         with TemporaryDirectory() as tmp:
@@ -715,18 +822,18 @@ class AppTests(unittest.TestCase):
         self.assertIn("魔女公主♪ 专属", prompt[-1]["content"])
 
     def test_summary_limit_is_one_batch(self):
-        self.assertEqual(DEFAULT_SUMMARY_LIMIT, 2000)
-        self.assertEqual(MAX_SUMMARY_LIMIT, 2000)
+        self.assertEqual(DEFAULT_SUMMARY_LIMIT, 5000)
+        self.assertEqual(MAX_SUMMARY_LIMIT, 5000)
         self.assertEqual(AUTO_SUMMARY_BATCH_LIMIT, 500)
 
     def test_manual_summary_limit_defaults_and_validates_range(self):
-        self.assertEqual(parse_manual_summary_limit(None), 2000)
-        self.assertEqual(parse_manual_summary_limit(""), 2000)
+        self.assertEqual(parse_manual_summary_limit(None), 5000)
+        self.assertEqual(parse_manual_summary_limit(""), 5000)
         self.assertEqual(parse_manual_summary_limit("1500"), 1500)
         with self.assertRaises(ValueError):
             parse_manual_summary_limit(0)
         with self.assertRaises(ValueError):
-            parse_manual_summary_limit(2001)
+            parse_manual_summary_limit(5001)
         with self.assertRaises(ValueError):
             parse_manual_summary_limit("1.5")
 

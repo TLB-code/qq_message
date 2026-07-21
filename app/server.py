@@ -26,7 +26,7 @@ from .onebot import (
     parse_group_message,
 )
 from .storage import Message, Store
-from .summarizer import DeepSeekClient, SummarizerError
+from .summarizer import DeepSeekClient, SummarizerError, SummaryBlock
 
 
 SETTINGS = load_settings()
@@ -38,8 +38,8 @@ SUMMARIZER = DeepSeekClient(
 )
 STATIC_DIR = BASE_DIR / "frontend" / "dist"
 WEBHOOK_LOG_PATH = SETTINGS.database_path.parent / "webhook_events.log"
-DEFAULT_SUMMARY_LIMIT = 2000
-MAX_SUMMARY_LIMIT = 2000
+DEFAULT_SUMMARY_LIMIT = 5000
+MAX_SUMMARY_LIMIT = 5000
 AUTO_SUMMARY_BATCH_LIMIT = 500
 DEFAULT_HISTORY_LIMIT = 50
 MAX_HISTORY_LIMIT = 100
@@ -188,6 +188,10 @@ def summary_task_payload(task: dict) -> dict:
         "group_id": str(task["group_id"]),
         "requested_limit": int(task["requested_limit"]),
         "status": str(task["status"]),
+        "stage": str(task.get("stage") or task["status"]),
+        "total_messages": int(task.get("total_messages") or 0),
+        "total_chunks": int(task.get("total_chunks") or 0),
+        "completed_chunks": int(task.get("completed_chunks") or 0),
         "summary_id": task.get("summary_id"),
         "message_count": task.get("message_count"),
         "error": task.get("error"),
@@ -280,6 +284,8 @@ def enqueue_auto_summary_if_needed(group_id: str) -> bool:
         return False
     if not STORE.is_group_auto_summary_enabled(group_id):
         return False
+    if STORE.get_active_summary_task(group_id):
+        return False
 
     unread_count = STORE.count_unread_message_records(group_id)
     if unread_count < SETTINGS.auto_summary_threshold:
@@ -348,19 +354,88 @@ def process_manual_summary_task(task_id: str) -> dict | None:
         STORE.mark_summary_task_running(task_id, int(time.time()))
         lock = summary_lock_for_group(str(task["group_id"]))
         with lock:
-            result = summarize_group_messages(
-                str(task["group_id"]),
-                limit=int(task["requested_limit"]),
+            records = STORE.list_summary_task_message_records(task_id)
+            if not records:
+                records = STORE.get_unread_message_records(
+                    str(task["group_id"]),
+                    limit=int(task["requested_limit"]),
+                )
+                if not records:
+                    raise ValueError("No unread messages to summarize")
+                STORE.save_summary_task_message_snapshot(task_id, records)
+                records = STORE.list_summary_task_message_records(task_id)
+
+            refreshed_task = STORE.get_summary_task(task_id) or task
+            expected_records = int(refreshed_task.get("total_messages") or len(records))
+            if len(records) != expected_records:
+                raise ValueError("Some messages in the summary task snapshot are no longer available")
+
+            group = STORE.get_group(str(task["group_id"]))
+            if not group:
+                raise ValueError("Group not found")
+            messages = [message_from_record(record) for record in records]
+            summary_messages = [
+                message
+                for message in (summary_message_from_record(record) for record in records)
+                if message is not None
+            ]
+
+            if summary_messages:
+                saved_blocks = {
+                    int(row["chunk_index"]): SummaryBlock(
+                        title=str(row["title"]),
+                        message_count=int(row["message_count"]),
+                        time_range=str(row["time_range"]),
+                        content=str(row["summary"]),
+                    )
+                    for row in STORE.list_summary_task_chunks(task_id)
+                }
+
+                def save_plan(total_chunks: int) -> None:
+                    STORE.set_summary_task_plan(task_id, total_chunks)
+
+                def save_chunk(chunk_index: int, block: SummaryBlock) -> None:
+                    STORE.save_summary_task_chunk(
+                        task_id,
+                        chunk_index=chunk_index,
+                        title=block.title,
+                        message_count=block.message_count,
+                        time_range=block.time_range,
+                        summary=block.content,
+                        completed_at=int(time.time()),
+                    )
+
+                summary = SUMMARIZER.summarize(
+                    str(group["group_name"]),
+                    summary_messages,
+                    existing_blocks=saved_blocks,
+                    plan_callback=save_plan,
+                    chunk_callback=save_chunk,
+                    stage_callback=lambda stage: STORE.set_summary_task_stage(task_id, stage),
+                )
+            else:
+                STORE.set_summary_task_plan(task_id, 0)
+                summary = MEDIA_ONLY_SUMMARY
+
+            STORE.set_summary_task_stage(task_id, "saving")
+            summary_id = STORE.save_summary(
+                group_id=str(task["group_id"]),
+                messages=messages,
+                summary=summary,
+                model=SETTINGS.deepseek_model,
+                created_at=int(time.time()),
                 mark_read=bool(task["mark_read"]),
+                task_id=task_id,
             )
-        STORE.complete_summary_task(
-            task_id,
-            summary_id=int(result["summary_id"]),
-            message_count=int(result["message_count"]),
-            completed_at=int(time.time()),
-        )
+            result = {
+                "summary_id": summary_id,
+                "message_count": len(messages),
+            }
+        enqueue_auto_summary_if_needed(str(task["group_id"]))
     except Exception as exc:
-        STORE.fail_summary_task(task_id, str(exc), int(time.time()))
+        current_task = STORE.get_summary_task(task_id)
+        if not current_task or current_task["status"] != "completed":
+            STORE.fail_summary_task(task_id, str(exc), int(time.time()))
         print(f"Manual summary task {task_id} failed: {exc}")
     return STORE.get_summary_task(task_id)
 
@@ -1064,9 +1139,11 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 def run() -> None:
     STORE.init()
-    interrupted_task_count = STORE.fail_interrupted_summary_tasks(int(time.time()))
-    start_auto_summary_worker()
+    resumable_task_ids = STORE.requeue_interrupted_summary_tasks()
     start_manual_summary_worker()
+    for task_id in resumable_task_ids:
+        MANUAL_SUMMARY_QUEUE.put(task_id)
+    start_auto_summary_worker()
     refresh_count = refresh_stored_cq_messages()
     auto_summary_count = enqueue_existing_auto_summaries()
     address = (SETTINGS.host, SETTINGS.port)
@@ -1084,8 +1161,8 @@ def run() -> None:
         print(f"Refreshed {refresh_count} stored CQ messages")
     if auto_summary_count:
         print(f"Queued {auto_summary_count} group(s) for automatic summary")
-    if interrupted_task_count:
-        print(f"Marked {interrupted_task_count} interrupted manual summary task(s) as failed")
+    if resumable_task_ids:
+        print(f"Resumed {len(resumable_task_ids)} manual summary task(s)")
     httpd.serve_forever()
 
 

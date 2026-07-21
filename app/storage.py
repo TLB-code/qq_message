@@ -90,6 +90,10 @@ class Store:
                     requested_limit INTEGER NOT NULL,
                     mark_read INTEGER NOT NULL DEFAULT 1,
                     status TEXT NOT NULL,
+                    stage TEXT NOT NULL DEFAULT 'queued',
+                    total_messages INTEGER NOT NULL DEFAULT 0,
+                    total_chunks INTEGER NOT NULL DEFAULT 0,
+                    completed_chunks INTEGER NOT NULL DEFAULT 0,
                     summary_id INTEGER,
                     message_count INTEGER,
                     error TEXT,
@@ -105,6 +109,26 @@ class Store:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_summary_tasks_active_group
                     ON summary_tasks(group_id)
                     WHERE status IN ('queued', 'running');
+
+                CREATE TABLE IF NOT EXISTS summary_task_messages (
+                    task_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    message_id TEXT NOT NULL,
+                    PRIMARY KEY (task_id, position),
+                    FOREIGN KEY (task_id) REFERENCES summary_tasks(task_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS summary_task_chunks (
+                    task_id TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    message_count INTEGER NOT NULL,
+                    time_range TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    completed_at INTEGER NOT NULL,
+                    PRIMARY KEY (task_id, chunk_index),
+                    FOREIGN KEY (task_id) REFERENCES summary_tasks(task_id)
+                );
                 """
             )
             group_columns = {
@@ -129,6 +153,19 @@ class Store:
             }
             if "is_read" not in columns:
                 conn.execute("ALTER TABLE summaries ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0")
+            task_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(summary_tasks)").fetchall()
+            }
+            task_column_migrations = {
+                "stage": "TEXT NOT NULL DEFAULT 'queued'",
+                "total_messages": "INTEGER NOT NULL DEFAULT 0",
+                "total_chunks": "INTEGER NOT NULL DEFAULT 0",
+                "completed_chunks": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for column_name, definition in task_column_migrations.items():
+                if column_name not in task_columns:
+                    conn.execute(f"ALTER TABLE summary_tasks ADD COLUMN {column_name} {definition}")
             if stats_migration_needed:
                 self._rebuild_group_stats(conn)
 
@@ -513,8 +550,8 @@ class Store:
                 conn.execute(
                     """
                     INSERT INTO summary_tasks (
-                        task_id, group_id, requested_limit, mark_read, status, created_at
-                    ) VALUES (?, ?, ?, ?, 'queued', ?)
+                        task_id, group_id, requested_limit, mark_read, status, stage, created_at
+                    ) VALUES (?, ?, ?, ?, 'queued', 'queued', ?)
                     """,
                     (task_id, group_id, requested_limit, int(mark_read), created_at),
                 )
@@ -570,10 +607,136 @@ class Store:
             conn.execute(
                 """
                 UPDATE summary_tasks
-                SET status = 'running', started_at = ?, error = NULL
+                SET status = 'running', stage = 'preparing',
+                    started_at = COALESCE(started_at, ?), error = NULL
                 WHERE task_id = ? AND status = 'queued'
                 """,
                 (started_at, task_id),
+            )
+
+    def save_summary_task_message_snapshot(
+        self,
+        task_id: str,
+        records: list[dict[str, Any]],
+    ) -> None:
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT COUNT(*) AS count FROM summary_task_messages WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if int(existing["count"] or 0) > 0:
+                return
+            conn.executemany(
+                """
+                INSERT INTO summary_task_messages (task_id, position, message_id)
+                VALUES (?, ?, ?)
+                """,
+                [
+                    (task_id, position, str(record["message_id"]))
+                    for position, record in enumerate(records)
+                ],
+            )
+            conn.execute(
+                """
+                UPDATE summary_tasks
+                SET total_messages = ?, stage = 'chunking'
+                WHERE task_id = ?
+                """,
+                (len(records), task_id),
+            )
+
+    def list_summary_task_message_records(self, task_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT m.message_id, m.group_id, m.user_id, m.sender_name,
+                       m.content, m.timestamp, m.raw_json
+                FROM summary_task_messages tm
+                JOIN messages m ON m.message_id = tm.message_id
+                WHERE tm.task_id = ?
+                ORDER BY tm.position ASC
+                """,
+                (task_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def set_summary_task_plan(self, task_id: str, total_chunks: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE summary_tasks
+                SET stage = 'summarizing', total_chunks = ?,
+                    completed_chunks = (
+                        SELECT COUNT(*) FROM summary_task_chunks WHERE task_id = ?
+                    )
+                WHERE task_id = ?
+                """,
+                (total_chunks, task_id, task_id),
+            )
+
+    def save_summary_task_chunk(
+        self,
+        task_id: str,
+        chunk_index: int,
+        title: str,
+        message_count: int,
+        time_range: str,
+        summary: str,
+        completed_at: int,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO summary_task_chunks (
+                    task_id, chunk_index, title, message_count,
+                    time_range, summary, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id, chunk_index) DO UPDATE SET
+                    title = excluded.title,
+                    message_count = excluded.message_count,
+                    time_range = excluded.time_range,
+                    summary = excluded.summary,
+                    completed_at = excluded.completed_at
+                """,
+                (
+                    task_id,
+                    chunk_index,
+                    title,
+                    message_count,
+                    time_range,
+                    summary,
+                    completed_at,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE summary_tasks
+                SET stage = 'summarizing', completed_chunks = (
+                    SELECT COUNT(*) FROM summary_task_chunks WHERE task_id = ?
+                )
+                WHERE task_id = ?
+                """,
+                (task_id, task_id),
+            )
+
+    def list_summary_task_chunks(self, task_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT chunk_index, title, message_count, time_range, summary, completed_at
+                FROM summary_task_chunks
+                WHERE task_id = ?
+                ORDER BY chunk_index ASC
+                """,
+                (task_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def set_summary_task_stage(self, task_id: str, stage: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE summary_tasks SET stage = ? WHERE task_id = ?",
+                (stage, task_id),
             )
 
     def complete_summary_task(
@@ -587,35 +750,43 @@ class Store:
             conn.execute(
                 """
                 UPDATE summary_tasks
-                SET status = 'completed', summary_id = ?, message_count = ?,
+                SET status = 'completed', stage = 'completed', summary_id = ?, message_count = ?,
                     error = NULL, completed_at = ?
                 WHERE task_id = ?
                 """,
                 (summary_id, message_count, completed_at, task_id),
             )
+            conn.execute("DELETE FROM summary_task_messages WHERE task_id = ?", (task_id,))
+            conn.execute("DELETE FROM summary_task_chunks WHERE task_id = ?", (task_id,))
 
     def fail_summary_task(self, task_id: str, error: str, completed_at: int) -> None:
         with self.connect() as conn:
             conn.execute(
                 """
                 UPDATE summary_tasks
-                SET status = 'failed', error = ?, completed_at = ?
+                SET status = 'failed', stage = 'failed', error = ?, completed_at = ?
                 WHERE task_id = ?
                 """,
                 (error, completed_at, task_id),
             )
 
-    def fail_interrupted_summary_tasks(self, completed_at: int) -> int:
+    def requeue_interrupted_summary_tasks(self) -> list[str]:
         with self.connect() as conn:
-            result = conn.execute(
+            conn.execute(
                 """
                 UPDATE summary_tasks
-                SET status = 'failed', error = '服务在任务完成前重启', completed_at = ?
-                WHERE status IN ('queued', 'running')
-                """,
-                (completed_at,),
+                SET status = 'queued', stage = 'resuming', error = NULL
+                WHERE status = 'running'
+                """
             )
-            return result.rowcount
+            rows = conn.execute(
+                """
+                SELECT task_id FROM summary_tasks
+                WHERE status = 'queued'
+                ORDER BY created_at ASC
+                """
+            ).fetchall()
+            return [str(row["task_id"]) for row in rows]
 
     def list_recent_messages(self, group_id: str, limit: int = 50) -> list[Message]:
         with self.connect() as conn:
@@ -821,6 +992,7 @@ class Store:
         model: str,
         created_at: int,
         mark_read: bool = True,
+        task_id: str | None = None,
     ) -> int:
         if not messages:
             raise ValueError("Cannot save a summary without messages")
@@ -895,6 +1067,19 @@ class Store:
                     """,
                     (processed_unread_count, group_id),
                 )
+            if task_id is not None:
+                conn.execute(
+                    """
+                    UPDATE summary_tasks
+                    SET status = 'completed', stage = 'completed',
+                        summary_id = ?, message_count = ?, error = NULL,
+                        completed_at = ?
+                    WHERE task_id = ?
+                    """,
+                    (summary_id, len(messages), created_at, task_id),
+                )
+                conn.execute("DELETE FROM summary_task_messages WHERE task_id = ?", (task_id,))
+                conn.execute("DELETE FROM summary_task_chunks WHERE task_id = ?", (task_id,))
             return summary_id
 
     def list_summaries(

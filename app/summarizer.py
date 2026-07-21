@@ -8,7 +8,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from .storage import Message
 
@@ -329,24 +329,47 @@ class DeepSeekClient:
         self.merge_max_chars = merge_max_chars
         self.chunk_parallelism = max(int(chunk_parallelism), 1)
 
-    def summarize(self, group_name: str, messages: list[Message]) -> str:
+    def summarize(
+        self,
+        group_name: str,
+        messages: list[Message],
+        existing_blocks: dict[int, SummaryBlock] | None = None,
+        plan_callback: Callable[[int], None] | None = None,
+        chunk_callback: Callable[[int, SummaryBlock], None] | None = None,
+        stage_callback: Callable[[str], None] | None = None,
+    ) -> str:
         if not self.api_key:
             raise SummarizerError("Missing DEEPSEEK_API_KEY environment variable")
         if not messages:
             raise SummarizerError("No messages to summarize")
 
+        saved_blocks = existing_blocks or {}
         can_use_single_call = (
             len(messages) <= self.chunk_max_messages
             and _formatted_messages_chars(messages) <= self.single_call_max_chars
         )
         if can_use_single_call:
-            return self._chat(
+            if plan_callback:
+                plan_callback(1)
+            saved = saved_blocks.get(1)
+            if saved is not None:
+                return saved.content
+            summary = self._chat(
                 build_summary_prompt(
                     group_name,
                     messages,
                     max_chars=self.single_call_max_chars,
                 )
             )
+            block = SummaryBlock(
+                title="完整摘要",
+                message_count=len(messages),
+                time_range=_message_time_range(messages),
+                content=summary,
+            )
+            if chunk_callback:
+                chunk_callback(1, block)
+            return summary
 
         chunks = split_messages(
             messages,
@@ -354,13 +377,30 @@ class DeepSeekClient:
             max_chars=self.chunk_max_chars,
         )
         if len(chunks) == 1:
-            return self._chat(
+            if plan_callback:
+                plan_callback(1)
+            saved = saved_blocks.get(1)
+            if saved is not None:
+                return saved.content
+            summary = self._chat(
                 build_summary_prompt(
                     group_name,
                     chunks[0],
                     max_chars=max(self.single_call_max_chars, self.chunk_max_chars),
                 )
             )
+            block = SummaryBlock(
+                title="完整摘要",
+                message_count=len(chunks[0]),
+                time_range=_message_time_range(chunks[0]),
+                content=summary,
+            )
+            if chunk_callback:
+                chunk_callback(1, block)
+            return summary
+
+        if plan_callback:
+            plan_callback(len(chunks))
 
         def summarize_chunk(item: tuple[int, list[Message]]) -> SummaryBlock:
             index, chunk = item
@@ -373,17 +413,33 @@ class DeepSeekClient:
                     max_chars=self.chunk_max_chars,
                 )
             )
-            return SummaryBlock(
+            block = SummaryBlock(
                 title=f"第 {index}/{len(chunks)} 块",
                 message_count=len(chunk),
                 time_range=_message_time_range(chunk),
                 content=chunk_summary,
             )
+            if chunk_callback:
+                chunk_callback(index, block)
+            return block
 
         indexed_chunks = list(enumerate(chunks, start=1))
-        worker_count = min(self.chunk_parallelism, len(indexed_chunks))
-        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="summary-chunk") as executor:
-            blocks = list(executor.map(summarize_chunk, indexed_chunks))
+        blocks_by_index = {
+            index: block
+            for index, block in saved_blocks.items()
+            if 1 <= index <= len(chunks)
+        }
+        pending_chunks = [item for item in indexed_chunks if item[0] not in blocks_by_index]
+        if pending_chunks:
+            worker_count = min(self.chunk_parallelism, len(pending_chunks))
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="summary-chunk") as executor:
+                completed = list(executor.map(summarize_chunk, pending_chunks))
+            for (index, _), block in zip(pending_chunks, completed):
+                blocks_by_index[index] = block
+
+        blocks = [blocks_by_index[index] for index in range(1, len(chunks) + 1)]
+        if stage_callback:
+            stage_callback("merging")
 
         return self._merge_summary_blocks(
             group_name=group_name,
