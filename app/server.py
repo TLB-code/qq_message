@@ -41,6 +41,8 @@ SUMMARIZER = DeepSeekClient(
     api_key=SETTINGS.deepseek_api_key,
     base_url=SETTINGS.deepseek_base_url,
     model=SETTINGS.deepseek_model,
+    timeout=SETTINGS.deepseek_timeout,
+    request_retries=SETTINGS.deepseek_request_retries,
     special_member_user_id=SETTINGS.special_member_user_id,
     special_member_display_name=SETTINGS.special_member_display_name,
 )

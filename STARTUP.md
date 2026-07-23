@@ -24,6 +24,8 @@ D:\tim\Desktop\qq_message\.env
 DEEPSEEK_API_KEY=sk-your-real-key
 DEEPSEEK_MODEL=deepseek-v4-flash
 DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_TIMEOUT=180
+DEEPSEEK_REQUEST_RETRIES=2
 
 QQ_SUMMARY_HOST=127.0.0.1
 QQ_SUMMARY_PORT=8000
@@ -48,6 +50,8 @@ QQ_SUMMARY_SPECIAL_MEMBER_DISPLAY_NAME=魔女公主♪
 | `DEEPSEEK_API_KEY` | 是 | `sk-xxxx` | DeepSeek API Key，用来调用 AI 总结接口。没有这个字段时，后端可以启动，但点击总结会失败。 |
 | `DEEPSEEK_MODEL` | 否 | `deepseek-v4-flash` | DeepSeek 模型名称。不填时默认使用代码里的默认值。 |
 | `DEEPSEEK_BASE_URL` | 否 | `https://api.deepseek.com` | DeepSeek API 地址。正常使用官方 DeepSeek 时保持这个值即可。 |
+| `DEEPSEEK_TIMEOUT` | 否 | `180` | 单次 DeepSeek 请求读取超时秒数，消息较多时建议保持 180 秒或更高。 |
+| `DEEPSEEK_REQUEST_RETRIES` | 否 | `2` | DeepSeek 请求遇到超时、限流或临时服务错误时的自动重试次数。 |
 | `QQ_SUMMARY_HOST` | 否 | `127.0.0.1` | 后端监听地址。本地只给自己用时用 `127.0.0.1`；部署到服务器并需要外部访问时通常改成 `0.0.0.0`。 |
 | `QQ_SUMMARY_PORT` | 否 | `8000` | 后端监听端口。打开网页时访问的端口就是这个。 |
 | `QQ_SUMMARY_DB` | 否 | `data/qq_summary.sqlite3` | SQLite 数据库路径，用来保存群、消息、总结历史、自动总结开关等数据。不填时默认保存到 `data/qq_summary.sqlite3`。 |

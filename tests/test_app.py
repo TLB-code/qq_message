@@ -4,6 +4,7 @@ import time
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from app.onebot import (
     message_display_parts,
@@ -1040,6 +1041,21 @@ class AppTests(unittest.TestCase):
             parsed,
             {"topics": [], "actions": [], "attention": [], "special_member": []},
         )
+
+    def test_deepseek_client_retries_read_timeouts(self):
+        client = DeepSeekClient(api_key="test", timeout=30, request_retries=2)
+
+        with (
+            patch(
+                "app.summarizer.urllib.request.urlopen",
+                side_effect=TimeoutError("The read operation timed out"),
+            ) as urlopen,
+            patch("app.summarizer.time.sleep"),
+        ):
+            with self.assertRaisesRegex(SummarizerError, "after 3 attempts"):
+                client._chat([{"role": "user", "content": "JSON"}])
+
+        self.assertEqual(urlopen.call_count, 3)
 
     def test_render_summary_uses_program_computed_range_and_gap(self):
         messages = [

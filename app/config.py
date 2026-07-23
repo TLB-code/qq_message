@@ -30,6 +30,8 @@ class Settings:
     deepseek_api_key: str | None
     deepseek_base_url: str
     deepseek_model: str
+    deepseek_timeout: int
+    deepseek_request_retries: int
     host: str
     port: int
     webhook_debug: bool
@@ -65,6 +67,8 @@ def load_settings() -> Settings:
         deepseek_api_key=os.getenv("DEEPSEEK_API_KEY"),
         deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+        deepseek_timeout=max(env_int("DEEPSEEK_TIMEOUT", 180), 30),
+        deepseek_request_retries=max(env_int("DEEPSEEK_REQUEST_RETRIES", 2), 0),
         host=os.getenv("QQ_SUMMARY_HOST", "127.0.0.1"),
         port=env_int("QQ_SUMMARY_PORT", 8000),
         webhook_debug=env_bool("QQ_SUMMARY_WEBHOOK_DEBUG"),

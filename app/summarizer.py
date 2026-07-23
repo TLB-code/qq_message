@@ -564,7 +564,8 @@ class DeepSeekClient:
         api_key: str | None,
         base_url: str = "https://api.deepseek.com",
         model: str = "deepseek-v4-flash",
-        timeout: int = 60,
+        timeout: int = 180,
+        request_retries: int = 2,
         single_call_max_chars: int = SINGLE_CALL_MAX_CHARS,
         chunk_max_messages: int = CHUNK_MAX_MESSAGES,
         chunk_max_chars: int = CHUNK_MAX_CHARS,
@@ -578,6 +579,7 @@ class DeepSeekClient:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
+        self.request_retries = max(int(request_retries), 0)
         self.single_call_max_chars = single_call_max_chars
         self.chunk_max_messages = chunk_max_messages
         self.chunk_max_chars = chunk_max_chars
@@ -949,14 +951,31 @@ class DeepSeekClient:
         )
 
         started_at = time.time()
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise SummarizerError(f"DeepSeek API returned HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise SummarizerError(f"DeepSeek API request failed: {exc.reason}") from exc
+        attempts = self.request_retries + 1
+        body = ""
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    body = response.read().decode("utf-8")
+                break
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                if exc.code not in {429, 500, 502, 503, 504} or attempt >= attempts - 1:
+                    raise SummarizerError(f"DeepSeek API returned HTTP {exc.code}: {detail}") from exc
+                last_error = exc
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                if attempt >= attempts - 1:
+                    elapsed = time.time() - started_at
+                    if isinstance(exc, TimeoutError) or "timed out" in str(exc).lower():
+                        raise SummarizerError(
+                            f"DeepSeek API read timed out after {attempts} attempts ({elapsed:.1f}s)"
+                        ) from exc
+                    raise SummarizerError(f"DeepSeek API request failed after {attempts} attempts: {exc}") from exc
+                last_error = exc
+            time.sleep(min(2 ** attempt, 5))
+        if not body:
+            raise SummarizerError(f"DeepSeek API request failed: {last_error}") from last_error
 
         try:
             data = json.loads(body)
