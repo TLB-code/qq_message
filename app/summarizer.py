@@ -14,16 +14,17 @@ from .storage import Message
 
 
 SINGLE_CALL_MAX_CHARS = 18000
-CHUNK_MAX_MESSAGES = 250
+CHUNK_MAX_MESSAGES = 125
 CHUNK_MAX_CHARS = 12000
-MERGE_MAX_BLOCKS = 12
+MERGE_MAX_BLOCKS = 3
 MERGE_MAX_CHARS = 18000
 SUMMARY_MAX_ITEMS = 30
 SUMMARY_MAX_CLAIMS_PER_ITEM = 3
 SUMMARY_RETRY_MAX_ITEMS = 20
 SUMMARY_RETRY_MAX_CLAIMS_PER_ITEM = 2
+REVIEW_BATCH_MAX_ITEMS = 10
 CHUNK_PARALLELISM = 4
-SUMMARY_PIPELINE_VERSION = 3
+SUMMARY_PIPELINE_VERSION = 4
 DEFAULT_SPECIAL_MEMBER_NAME = "魔女公主♪"
 EVIDENCE_TYPES = {
     "confirmed_fact",
@@ -348,6 +349,7 @@ def build_review_summary_prompt(
     group_name: str,
     payload: dict[str, list[dict[str, Any]]],
     messages: list[Message],
+    section_name: str = "摘要栏目",
 ) -> list[dict[str, str]]:
     positions = {
         position
@@ -362,7 +364,7 @@ def build_review_summary_prompt(
         "证据不能直接支持主张时必须删除该主张；玩笑必须降级为 banter。"
     )
     user = f"""
-请复核 QQ 群「{group_name}」的候选事件。
+请复核 QQ 群「{group_name}」的“{section_name}”候选事件。
 只输出与候选相同的 JSON 结构：{{"items": [...]}}。
 
 复核规则：
@@ -706,16 +708,14 @@ def _render_items(
     return lines
 
 
-def render_summary(
-    payload: dict[str, list[dict[str, Any]]],
-    summary_messages: list[Message],
-    source_messages: list[Message],
-    total_chunk_count: int,
-    special_member_name: str,
-) -> str:
-    messages_by_position = {message.position: message for message in summary_messages}
-    display_names = _display_names(summary_messages, special_member_name)
-    items = _merge_duplicate_items([dict(item) for item in payload["items"]])
+def _section_items(
+    items: list[dict[str, Any]],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     attention_items = [item for item in items if item["attention_reason"] != "none"]
     action_items = [
         item
@@ -734,6 +734,26 @@ def render_summary(
         )
     ]
     special_items = [item for item in items if item["special_related"]]
+    return topic_items, action_items, attention_items, special_items
+
+
+def render_summary(
+    payload: dict[str, list[dict[str, Any]]],
+    summary_messages: list[Message],
+    source_messages: list[Message],
+    total_chunk_count: int,
+    special_member_name: str,
+    special_payload: dict[str, list[dict[str, Any]]] | None = None,
+) -> str:
+    messages_by_position = {message.position: message for message in summary_messages}
+    display_names = _display_names(summary_messages, special_member_name)
+    items = _merge_duplicate_items([dict(item) for item in payload["items"]])
+    topic_items, action_items, attention_items, default_special_items = _section_items(items)
+    special_items = (
+        _merge_duplicate_items([dict(item) for item in special_payload["items"]])
+        if special_payload is not None
+        else default_special_items
+    )
     overview_items = sorted(
         items,
         key=lambda item: _item_score(item, messages_by_position),
@@ -850,13 +870,16 @@ class DeepSeekClient:
                     {message.position for message in messages},
                     self._special_positions(messages),
                 )
-                payload = self._review_payload(group_name, payload, messages, stage_callback)
+                payload, special_payload = self._review_payload(
+                    group_name, payload, messages, stage_callback
+                )
                 return render_summary(
                     payload,
                     messages,
                     source_messages,
                     1,
                     self.special_member_display_name,
+                    special_payload,
                 )
             payload = self._chat_structured(
                 build_summary_prompt(
@@ -875,13 +898,16 @@ class DeepSeekClient:
             )
             if chunk_callback:
                 chunk_callback(1, block)
-            payload = self._review_payload(group_name, payload, messages, stage_callback)
+            payload, special_payload = self._review_payload(
+                group_name, payload, messages, stage_callback
+            )
             return render_summary(
                 payload,
                 messages,
                 source_messages,
                 1,
                 self.special_member_display_name,
+                special_payload,
             )
 
         chunks = split_messages(
@@ -899,13 +925,16 @@ class DeepSeekClient:
                     {message.position for message in chunks[0]},
                     self._special_positions(chunks[0]),
                 )
-                payload = self._review_payload(group_name, payload, messages, stage_callback)
+                payload, special_payload = self._review_payload(
+                    group_name, payload, messages, stage_callback
+                )
                 return render_summary(
                     payload,
                     messages,
                     source_messages,
                     1,
                     self.special_member_display_name,
+                    special_payload,
                 )
             payload = self._chat_structured(
                 build_summary_prompt(
@@ -924,13 +953,16 @@ class DeepSeekClient:
             )
             if chunk_callback:
                 chunk_callback(1, block)
-            payload = self._review_payload(group_name, payload, messages, stage_callback)
+            payload, special_payload = self._review_payload(
+                group_name, payload, messages, stage_callback
+            )
             return render_summary(
                 payload,
                 messages,
                 source_messages,
                 1,
                 self.special_member_display_name,
+                special_payload,
             )
 
         if plan_callback:
@@ -984,13 +1016,16 @@ class DeepSeekClient:
             total_chunk_count=len(chunks),
             messages=messages,
         )
-        payload = self._review_payload(group_name, payload, messages, stage_callback)
+        payload, special_payload = self._review_payload(
+            group_name, payload, messages, stage_callback
+        )
         return render_summary(
             payload,
             messages,
             source_messages,
             len(chunks),
             self.special_member_display_name,
+            special_payload,
         )
 
     def _review_payload(
@@ -999,27 +1034,62 @@ class DeepSeekClient:
         payload: dict[str, list[dict[str, Any]]],
         messages: list[Message],
         stage_callback: Callable[[str], None] | None,
-    ) -> dict[str, list[dict[str, Any]]]:
+    ) -> tuple[
+        dict[str, list[dict[str, Any]]],
+        dict[str, list[dict[str, Any]]],
+    ]:
         if not payload["items"]:
-            return payload
+            return payload, {"items": []}
         if stage_callback:
             stage_callback("reviewing")
-        allowed_positions = {
-            position
-            for item in payload["items"]
-            for claim in item["claims"]
-            for position in claim["evidence"]
-        }
-        evidence_messages = [message for message in messages if message.position in allowed_positions]
-        reviewed = self._chat_structured(
-            build_review_summary_prompt(group_name, payload, messages),
-            evidence_messages,
-        )
-        original_evidence_sets = [set(item["evidence"]) for item in payload["items"]]
-        for item in reviewed["items"]:
-            if not any(set(item["evidence"]).issubset(source) for source in original_evidence_sets):
-                raise SummarizerError("Evidence review mixed evidence from different candidate events")
-        return reviewed
+
+        topic_items, action_items, attention_items, special_items = _section_items(payload["items"])
+
+        def review_batches(
+            section_name: str,
+            items: list[dict[str, Any]],
+        ) -> list[dict[str, Any]]:
+            reviewed_items: list[dict[str, Any]] = []
+            for start in range(0, len(items), REVIEW_BATCH_MAX_ITEMS):
+                batch_items = items[start : start + REVIEW_BATCH_MAX_ITEMS]
+                batch_payload = {"items": batch_items}
+                allowed_positions = {
+                    position
+                    for item in batch_items
+                    for claim in item["claims"]
+                    for position in claim["evidence"]
+                }
+                evidence_messages = [
+                    message for message in messages if message.position in allowed_positions
+                ]
+                reviewed = self._chat_structured(
+                    build_review_summary_prompt(
+                        group_name,
+                        batch_payload,
+                        messages,
+                        section_name=section_name,
+                    ),
+                    evidence_messages,
+                )
+                original_evidence_sets = [set(item["evidence"]) for item in batch_items]
+                for item in reviewed["items"]:
+                    if not any(
+                        set(item["evidence"]).issubset(source)
+                        for source in original_evidence_sets
+                    ):
+                        raise SummarizerError(
+                            "Evidence review mixed evidence from different candidate events"
+                        )
+                reviewed_items.extend(reviewed["items"])
+            return reviewed_items
+
+        main_items = [
+            *review_batches("重点话题", topic_items),
+            *review_batches("待办/决定", action_items),
+            *review_batches("需要关注", attention_items),
+        ]
+        special_reviewed = review_batches("重点成员专属", special_items)
+        return {"items": main_items}, {"items": special_reviewed}
 
     def _merge_summary_blocks(
         self,
@@ -1029,27 +1099,16 @@ class DeepSeekClient:
         total_chunk_count: int,
         messages: list[Message],
     ) -> dict[str, list[dict[str, Any]]]:
-        if len(blocks) <= self.merge_max_blocks and len(_summary_blocks_text(blocks)) <= self.merge_max_chars:
-            return self._chat_structured(
-                build_merge_summary_prompt(
-                    group_name=group_name,
-                    blocks=blocks,
-                    total_message_count=total_message_count,
-                    total_chunk_count=total_chunk_count,
-                    final=True,
-                    max_chars=self.merge_max_chars,
-                    special_member_name=self.special_member_display_name,
-                ),
-                messages,
-                source_blocks=blocks,
+        if not blocks:
+            return {"items": []}
+        fan_in = min(self.merge_max_blocks, 3)
+        if len(blocks) == 1:
+            return parse_summary_json(
+                blocks[0].content,
+                self._block_positions(blocks[0]),
+                self._special_positions(messages),
             )
-
-        batches = split_summary_blocks(
-            blocks,
-            max_blocks=self.merge_max_blocks,
-            max_chars=self.merge_max_chars,
-        )
-        if len(batches) == 1 or len(batches) == len(blocks):
+        if len(blocks) <= fan_in:
             return self._chat_structured(
                 build_merge_summary_prompt(
                     group_name=group_name,
@@ -1065,7 +1124,11 @@ class DeepSeekClient:
             )
 
         reduced_blocks: list[SummaryBlock] = []
+        batches = [blocks[index : index + fan_in] for index in range(0, len(blocks), fan_in)]
         for index, batch in enumerate(batches, start=1):
+            if len(batch) == 1:
+                reduced_blocks.append(batch[0])
+                continue
             batch_positions = {
                 position
                 for block in batch

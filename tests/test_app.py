@@ -2,6 +2,7 @@ import unittest
 import threading
 import time
 import json
+import re
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -34,6 +35,7 @@ from app.server import (
 from app.storage import Message, Store
 from app.summarizer import (
     DeepSeekClient,
+    SummaryBlock,
     SummarizerError,
     build_summary_prompt,
     compact_messages,
@@ -897,6 +899,116 @@ class AppTests(unittest.TestCase):
         self.assertIn("暂无明确重点话题", summary)
         self.assertEqual(len(client.calls), 4)
         self.assertEqual(client.calls[-1][0]["role"], "system")
+
+    def test_tree_merge_never_sends_more_than_three_blocks(self):
+        class TreeMergeClient(DeepSeekClient):
+            def __init__(self):
+                super().__init__(api_key="test", merge_max_blocks=12, merge_max_chars=100000)
+                self.merge_sizes = []
+
+            def _chat(self, messages):
+                content = messages[-1]["content"]
+                match = re.search(r"当前待合并摘要数：(\d+)", content)
+                if match:
+                    self.merge_sizes.append(int(match.group(1)))
+                return EMPTY_SUMMARY_JSON
+
+        client = TreeMergeClient()
+        blocks = [
+            SummaryBlock(
+                title=f"块{i}",
+                message_count=1,
+                time_range="06-10 00:00",
+                content=EMPTY_SUMMARY_JSON,
+            )
+            for i in range(10)
+        ]
+        messages = [Message(str(i), "1", f"u{i}", f"用户{i}", "消息", 100 + i) for i in range(10)]
+
+        result = client._merge_summary_blocks(
+            "test group",
+            blocks,
+            total_message_count=10,
+            total_chunk_count=10,
+            messages=messages,
+        )
+
+        self.assertEqual(result, {"items": []})
+        self.assertTrue(client.merge_sizes)
+        self.assertLessEqual(max(client.merge_sizes), 3)
+        self.assertGreater(len(client.merge_sizes), 1)
+
+    def test_review_is_split_by_display_section(self):
+        class SectionReviewClient(DeepSeekClient):
+            def __init__(self):
+                super().__init__(api_key="test")
+                self.sections = []
+
+            def _chat(self, messages):
+                content = messages[-1]["content"]
+                for section in ("重点话题", "待办/决定", "需要关注", "重点成员专属"):
+                    if f"“{section}”候选事件" in content:
+                        self.sections.append(section)
+                return EMPTY_SUMMARY_JSON
+
+        items = [
+            {
+                "title": "话题",
+                "type": "confirmed_fact",
+                "action_state": "none",
+                "attention_reason": "none",
+                "special_related": False,
+                "special_evidence": [],
+                "claims": [{"text": "普通事实", "evidence": [1]}],
+                "evidence": [1],
+            },
+            {
+                "title": "待办",
+                "type": "confirmed_plan",
+                "action_state": "open",
+                "attention_reason": "none",
+                "special_related": False,
+                "special_evidence": [],
+                "claims": [{"text": "有待办", "evidence": [2]}],
+                "evidence": [2],
+            },
+            {
+                "title": "担忧",
+                "type": "reported_concern",
+                "action_state": "none",
+                "attention_reason": "explicit_concern",
+                "special_related": False,
+                "special_evidence": [],
+                "claims": [{"text": "有人明确担忧", "evidence": [3]}],
+                "evidence": [3],
+            },
+            {
+                "title": "重点成员互动",
+                "type": "banter",
+                "action_state": "none",
+                "attention_reason": "none",
+                "special_related": True,
+                "special_evidence": [4],
+                "claims": [{"text": "重点成员互动", "evidence": [4]}],
+                "evidence": [4],
+            },
+        ]
+        messages = [Message(str(i), "1", f"u{i}", f"用户{i}", "消息", 100 + i) for i in range(1, 5)]
+
+        client = SectionReviewClient()
+        payload, special_payload = client._review_payload(
+            "test group",
+            {"items": items},
+            messages,
+            None,
+        )
+
+        self.assertEqual(payload, {"items": []})
+        self.assertEqual(special_payload, {"items": []})
+        self.assertEqual(
+            client.sections,
+            ["重点话题", "待办/决定", "需要关注", "重点成员专属"],
+        )
 
     def test_deepseek_client_summarizes_chunks_in_parallel(self):
         class ParallelFakeClient(DeepSeekClient):
