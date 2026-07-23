@@ -1296,6 +1296,103 @@ class AppTests(unittest.TestCase):
         self.assertIn("最多输出 20 个事件", client.calls[1][-1]["content"])
         self.assertIn("不要续写", client.calls[1][-1]["content"])
 
+    def test_invalid_merge_json_uses_programmatic_fallback(self):
+        class InvalidMergeClient(DeepSeekClient):
+            def __init__(self):
+                super().__init__(api_key="test")
+
+            def _chat(self, messages):
+                return '{"items":['
+
+        def block(position):
+            return SummaryBlock(
+                title=f"块{position}",
+                message_count=1,
+                time_range="06-10 00:00",
+                content=json.dumps(
+                    {
+                        "items": [
+                            {
+                                "title": f"事件{position}",
+                                "type": "confirmed_fact",
+                                "action_state": "none",
+                                "attention_reason": "none",
+                                "claims": [
+                                    {"text": f"发送者陈述事件{position}", "evidence": [position]}
+                                ],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+
+        client = InvalidMergeClient()
+        messages = [
+            Message(str(position), "1", f"u{position}", f"用户{position}", "消息", 100 + position, position=position)
+            for position in (1, 2)
+        ]
+
+        with patch("builtins.print") as output:
+            payload = client._merge_summary_blocks(
+                "test group",
+                [block(1), block(2)],
+                total_message_count=2,
+                total_chunk_count=2,
+                messages=messages,
+            )
+
+        self.assertEqual([item["title"] for item in payload["items"]], ["事件1", "事件2"])
+        self.assertTrue(any("programmatic merge" in str(call) for call in output.call_args_list))
+
+    def test_invalid_review_json_keeps_validated_candidates(self):
+        class InvalidReviewClient(DeepSeekClient):
+            def __init__(self):
+                super().__init__(api_key="test")
+
+            def _chat(self, messages):
+                return "not json"
+
+        item = {
+            "title": "已验证事件",
+            "type": "confirmed_fact",
+            "action_state": "none",
+            "attention_reason": "none",
+            "special_related": False,
+            "special_evidence": [],
+            "claims": [{"text": "发送者说明情况", "evidence": [1]}],
+            "evidence": [1],
+        }
+        messages = [Message("1", "1", "u1", "用户1", "消息", 101, position=1)]
+
+        with patch("builtins.print") as output:
+            payload, special_payload = InvalidReviewClient()._review_payload(
+                "test group",
+                {"items": [item]},
+                messages,
+                None,
+            )
+
+        self.assertEqual(payload["items"], [item])
+        self.assertEqual(special_payload, {"items": []})
+        self.assertTrue(any("using validated candidates" in str(call) for call in output.call_args_list))
+
+    def test_invalid_chunk_json_reports_operation(self):
+        class InvalidChunkClient(DeepSeekClient):
+            def __init__(self):
+                super().__init__(api_key="test")
+
+            def _chat(self, messages):
+                return "not json"
+
+        with patch("builtins.print"):
+            with self.assertRaisesRegex(SummarizerError, "chunk 3/32"):
+                InvalidChunkClient()._chat_structured(
+                    [{"role": "user", "content": "总结"}],
+                    [Message("1", "1", "u1", "用户1", "消息", 101, position=1)],
+                    operation="chunk 3/32",
+                )
+
     def test_confirmed_plan_is_programmatically_routed_as_open(self):
         payload = {
             "items": [
@@ -1480,7 +1577,7 @@ class AppTests(unittest.TestCase):
             self.assertEqual(task["completed_chunks"], 0)
             self.assertEqual(store.list_summary_task_chunks("old-task"), [])
 
-    def test_merge_rejects_evidence_type_promotion(self):
+    def test_merge_type_promotion_falls_back_to_source_events(self):
         class PromotionClient(DeepSeekClient):
             def __init__(self):
                 super().__init__(
@@ -1520,8 +1617,11 @@ class AppTests(unittest.TestCase):
             Message("2", "1", "u2", "乙", "玩笑回应", 101),
         ]
 
-        with self.assertRaises(SummarizerError):
-            PromotionClient().summarize("test group", messages)
+        with patch("builtins.print"):
+            summary = PromotionClient().summarize("test group", messages)
+
+        self.assertIn("玩笑互动", summary)
+        self.assertNotIn("已确认事实", summary)
 
     def test_merge_can_inherit_action_state_from_one_source_item(self):
         class ActionMergeClient(DeepSeekClient):

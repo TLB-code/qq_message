@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -23,8 +24,9 @@ SUMMARY_MAX_CLAIMS_PER_ITEM = 3
 SUMMARY_RETRY_MAX_ITEMS = 20
 SUMMARY_RETRY_MAX_CLAIMS_PER_ITEM = 2
 REVIEW_BATCH_MAX_ITEMS = 10
+FALLBACK_MAX_ITEMS = 60
 CHUNK_PARALLELISM = 4
-SUMMARY_PIPELINE_VERSION = 5
+SUMMARY_PIPELINE_VERSION = 6
 DEFAULT_SPECIAL_MEMBER_NAME = "魔女公主♪"
 EVIDENCE_TYPES = {
     "confirmed_fact",
@@ -50,6 +52,10 @@ ESCALATION_PATTERN = re.compile(r"需要支援|需要回应|尚未解决|未解�
 
 
 class SummarizerError(RuntimeError):
+    pass
+
+
+class InvalidSummaryJSONError(SummarizerError):
     pass
 
 
@@ -420,11 +426,11 @@ def _decode_json_object(value: str) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         object_start = text.find("{")
         if object_start < 0:
-            raise SummarizerError("DeepSeek did not return valid summary JSON") from exc
+            raise InvalidSummaryJSONError("DeepSeek did not return valid summary JSON") from exc
         try:
             payload, _ = json.JSONDecoder().raw_decode(text[object_start:])
         except json.JSONDecodeError as nested_exc:
-            raise SummarizerError("DeepSeek did not return valid summary JSON") from nested_exc
+            raise InvalidSummaryJSONError("DeepSeek did not return valid summary JSON") from nested_exc
     if not isinstance(payload, dict):
         raise SummarizerError("DeepSeek summary JSON must be an object")
     return payload
@@ -852,6 +858,7 @@ class DeepSeekClient:
         self.chunk_parallelism = max(int(chunk_parallelism), 1)
         self.special_member_user_id = special_member_user_id
         self.special_member_display_name = special_member_display_name
+        self._chat_state = threading.local()
 
     def summarize(
         self,
@@ -904,6 +911,7 @@ class DeepSeekClient:
                     special_member_name=self.special_member_display_name,
                 ),
                 messages,
+                operation="single summary",
             )
             block = SummaryBlock(
                 title="完整摘要",
@@ -959,6 +967,7 @@ class DeepSeekClient:
                     special_member_name=self.special_member_display_name,
                 ),
                 chunks[0],
+                operation="chunk 1/1",
             )
             block = SummaryBlock(
                 title="完整摘要",
@@ -995,6 +1004,7 @@ class DeepSeekClient:
                     special_member_name=self.special_member_display_name,
                 ),
                 chunk,
+                operation=f"chunk {index}/{len(chunks)}",
             )
             block = SummaryBlock(
                 title=f"第 {index}/{len(chunks)} 块",
@@ -1065,9 +1075,12 @@ class DeepSeekClient:
             items: list[dict[str, Any]],
         ) -> list[dict[str, Any]]:
             reviewed_items: list[dict[str, Any]] = []
+            total_batches = (len(items) + REVIEW_BATCH_MAX_ITEMS - 1) // REVIEW_BATCH_MAX_ITEMS
             for start in range(0, len(items), REVIEW_BATCH_MAX_ITEMS):
                 batch_items = items[start : start + REVIEW_BATCH_MAX_ITEMS]
                 batch_payload = {"items": batch_items}
+                batch_number = start // REVIEW_BATCH_MAX_ITEMS + 1
+                operation = f"review section={section_name} batch={batch_number}/{total_batches}"
                 allowed_positions = {
                     position
                     for item in batch_items
@@ -1077,25 +1090,33 @@ class DeepSeekClient:
                 evidence_messages = [
                     message for message in messages if message.position in allowed_positions
                 ]
-                reviewed = self._chat_structured(
-                    build_review_summary_prompt(
-                        group_name,
-                        batch_payload,
-                        messages,
-                        section_name=section_name,
-                    ),
-                    evidence_messages,
-                )
-                original_evidence_sets = [set(item["evidence"]) for item in batch_items]
-                for item in reviewed["items"]:
-                    if not any(
-                        set(item["evidence"]).issubset(source)
-                        for source in original_evidence_sets
-                    ):
-                        raise SummarizerError(
-                            "Evidence review mixed evidence from different candidate events"
-                        )
-                reviewed_items.extend(reviewed["items"])
+                try:
+                    reviewed = self._chat_structured(
+                        build_review_summary_prompt(
+                            group_name,
+                            batch_payload,
+                            messages,
+                            section_name=section_name,
+                        ),
+                        evidence_messages,
+                        operation=operation,
+                    )
+                    original_evidence_sets = [set(item["evidence"]) for item in batch_items]
+                    for item in reviewed["items"]:
+                        if not any(
+                            set(item["evidence"]).issubset(source)
+                            for source in original_evidence_sets
+                        ):
+                            raise SummarizerError(
+                                "Evidence review mixed evidence from different candidate events"
+                            )
+                    reviewed_items.extend(reviewed["items"])
+                except SummarizerError as exc:
+                    print(
+                        f"Summary warning: {operation} failed; using validated candidates: {exc}",
+                        flush=True,
+                    )
+                    reviewed_items.extend(batch_items)
             return reviewed_items
 
         main_items = [
@@ -1106,6 +1127,50 @@ class DeepSeekClient:
         special_reviewed = review_batches("重点成员专属", special_items)
         return {"items": main_items}, {"items": special_reviewed}
 
+    def _merge_blocks_programmatically(
+        self,
+        blocks: list[SummaryBlock],
+        messages: list[Message],
+    ) -> dict[str, list[dict[str, Any]]]:
+        special_positions = self._special_positions(messages)
+        items: list[dict[str, Any]] = []
+        for block in blocks:
+            block_positions = self._block_positions(block)
+            payload = parse_summary_json(
+                block.content,
+                block_positions,
+                special_positions,
+            )
+            items.extend(dict(item) for item in payload["items"])
+
+        merged = _merge_duplicate_items(items)
+        if len(merged) > FALLBACK_MAX_ITEMS:
+            messages_by_position = {message.position: message for message in messages}
+            ranked = sorted(
+                enumerate(merged),
+                key=lambda pair: (
+                    _item_score(pair[1], messages_by_position)
+                    + (4 if pair[1]["special_related"] else 0)
+                ),
+                reverse=True,
+            )[:FALLBACK_MAX_ITEMS]
+            merged = [merged[index] for index, _ in sorted(ranked)]
+
+        for item in merged:
+            item["claims"] = item["claims"][:SUMMARY_MAX_CLAIMS_PER_ITEM]
+            item["evidence"] = list(
+                dict.fromkeys(
+                    position
+                    for claim in item["claims"]
+                    for position in claim["evidence"]
+                )
+            )
+            item["special_evidence"] = [
+                position for position in item["evidence"] if position in special_positions
+            ]
+            item["special_related"] = bool(item["special_evidence"])
+        return {"items": merged}
+
     def _merge_summary_blocks(
         self,
         group_name: str,
@@ -1113,6 +1178,7 @@ class DeepSeekClient:
         total_message_count: int,
         total_chunk_count: int,
         messages: list[Message],
+        level: int = 1,
     ) -> dict[str, list[dict[str, Any]]]:
         if not blocks:
             return {"items": []}
@@ -1124,19 +1190,28 @@ class DeepSeekClient:
                 self._special_positions(messages),
             )
         if len(blocks) <= fan_in:
-            return self._chat_structured(
-                build_merge_summary_prompt(
-                    group_name=group_name,
-                    blocks=blocks,
-                    total_message_count=total_message_count,
-                    total_chunk_count=total_chunk_count,
-                    final=True,
-                    max_chars=self.merge_max_chars,
-                    special_member_name=self.special_member_display_name,
-                ),
-                messages,
-                source_blocks=blocks,
-            )
+            operation = f"merge level={level} final blocks={len(blocks)}"
+            try:
+                return self._chat_structured(
+                    build_merge_summary_prompt(
+                        group_name=group_name,
+                        blocks=blocks,
+                        total_message_count=total_message_count,
+                        total_chunk_count=total_chunk_count,
+                        final=True,
+                        max_chars=self.merge_max_chars,
+                        special_member_name=self.special_member_display_name,
+                    ),
+                    messages,
+                    source_blocks=blocks,
+                    operation=operation,
+                )
+            except SummarizerError as exc:
+                print(
+                    f"Summary warning: {operation} failed; using programmatic merge: {exc}",
+                    flush=True,
+                )
+                return self._merge_blocks_programmatically(blocks, messages)
 
         reduced_blocks: list[SummaryBlock] = []
         batches = [blocks[index : index + fan_in] for index in range(0, len(blocks), fan_in)]
@@ -1150,19 +1225,28 @@ class DeepSeekClient:
                 for position in self._block_positions(block)
             }
             batch_messages = [message for message in messages if message.position in batch_positions]
-            merged = self._chat_structured(
-                build_merge_summary_prompt(
-                    group_name=group_name,
-                    blocks=batch,
-                    total_message_count=sum(block.message_count for block in batch),
-                    total_chunk_count=total_chunk_count,
-                    final=False,
-                    max_chars=self.merge_max_chars,
-                    special_member_name=self.special_member_display_name,
-                ),
-                batch_messages,
-                source_blocks=batch,
-            )
+            operation = f"merge level={level} batch={index}/{len(batches)} blocks={len(batch)}"
+            try:
+                merged = self._chat_structured(
+                    build_merge_summary_prompt(
+                        group_name=group_name,
+                        blocks=batch,
+                        total_message_count=sum(block.message_count for block in batch),
+                        total_chunk_count=total_chunk_count,
+                        final=False,
+                        max_chars=self.merge_max_chars,
+                        special_member_name=self.special_member_display_name,
+                    ),
+                    batch_messages,
+                    source_blocks=batch,
+                    operation=operation,
+                )
+            except SummarizerError as exc:
+                print(
+                    f"Summary warning: {operation} failed; using programmatic merge: {exc}",
+                    flush=True,
+                )
+                merged = self._merge_blocks_programmatically(batch, batch_messages)
             reduced_blocks.append(
                 SummaryBlock(
                     title=f"合并块 {index}/{len(batches)}",
@@ -1178,6 +1262,7 @@ class DeepSeekClient:
             total_message_count=total_message_count,
             total_chunk_count=total_chunk_count,
             messages=messages,
+            level=level + 1,
         )
 
     @staticmethod
@@ -1270,6 +1355,7 @@ class DeepSeekClient:
         messages: list[dict[str, str]],
         source_messages: list[Message],
         source_blocks: list[SummaryBlock] | None = None,
+        operation: str = "structured summary",
     ) -> dict[str, list[dict[str, Any]]]:
         allowed_positions = {message.position for message in source_messages}
         special_positions = self._special_positions(source_messages)
@@ -1285,8 +1371,13 @@ class DeepSeekClient:
             ) = self._block_evidence_metadata(source_blocks)
         last_error: SummarizerError | None = None
         prompt = list(messages)
+        raw = ""
         for attempt in range(3):
-            raw = self._chat(prompt)
+            self._chat_state.metadata = {}
+            try:
+                raw = self._chat(prompt)
+            except SummarizerError as exc:
+                raise SummarizerError(f"{operation}: {exc}") from exc
             try:
                 payload = parse_summary_json(raw, allowed_positions, special_positions)
                 self._neutralize_generated_identities(payload, source_messages)
@@ -1317,7 +1408,7 @@ class DeepSeekClient:
             except SummarizerError as exc:
                 last_error = exc
                 if attempt < 2:
-                    invalid_json = str(exc) == "DeepSeek did not return valid summary JSON"
+                    invalid_json = isinstance(exc, InvalidSummaryJSONError)
                     correction = (
                         f"上次输出未通过校验：{exc}。"
                         + (
@@ -1344,7 +1435,20 @@ class DeepSeekClient:
                     if not invalid_json:
                         prompt.append({"role": "assistant", "content": raw})
                     prompt.append({"role": "user", "content": correction})
-        raise last_error or SummarizerError("Unable to validate DeepSeek summary JSON")
+        metadata = getattr(self._chat_state, "metadata", {})
+        finish_reason = metadata.get("finish_reason", "unknown")
+        response_chars = metadata.get("response_chars", len(raw))
+        response_tail = metadata.get("response_tail", raw[-300:])
+        print(
+            "Summary structured output failed: "
+            f"operation={operation}; finish_reason={finish_reason}; "
+            f"response_chars={response_chars}; response_tail="
+            f"{json.dumps(response_tail, ensure_ascii=False)}",
+            flush=True,
+        )
+        if last_error is not None:
+            raise SummarizerError(f"{operation}: {last_error}") from last_error
+        raise SummarizerError(f"{operation}: Unable to validate DeepSeek summary JSON")
 
     def _chat(self, messages: list[dict[str, str]]) -> str:
         payload: dict[str, Any] = {
@@ -1394,9 +1498,16 @@ class DeepSeekClient:
 
         try:
             data = json.loads(body)
-            content = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
         except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
             elapsed = time.time() - started_at
             raise SummarizerError(f"Unexpected DeepSeek API response after {elapsed:.1f}s") from exc
 
-        return strip_markdown_noise(str(content))
+        content_text = str(content)
+        self._chat_state.metadata = {
+            "finish_reason": str(choice.get("finish_reason") or "unknown"),
+            "response_chars": len(content_text),
+            "response_tail": content_text[-300:],
+        }
+        return strip_markdown_noise(content_text)
