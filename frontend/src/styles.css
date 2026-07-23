@@ -489,9 +489,8 @@ button:disabled {
 }
 
 .status-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+  display: grid;
+  gap: 10px;
   margin-bottom: 14px;
   border: 1px solid #bfe4dc;
   border-radius: 8px;
@@ -501,9 +500,33 @@ button:disabled {
   font-size: 13px;
 }
 
-.status-bar > span {
+.status-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.status-main > span:first-of-type {
   min-width: 0;
   flex: 1;
+}
+
+.summary-mode-badge {
+  flex: 0 0 auto;
+  border: 1px solid #91cfc5;
+  border-radius: 999px;
+  background: #ffffff;
+  padding: 3px 8px;
+  color: var(--accent-strong);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.summary-mode-badge.fast {
+  border-color: #adc6f7;
+  background: var(--blue-soft);
+  color: var(--blue);
 }
 
 .summary-task-progress {
@@ -525,6 +548,58 @@ button:disabled {
 .summary-task-progress strong {
   min-width: 34px;
   text-align: right;
+}
+
+.summary-task-events {
+  display: grid;
+  gap: 5px;
+  max-height: 170px;
+  overflow-y: auto;
+  border-top: 1px solid rgb(15 104 98 / 16%);
+  padding-top: 9px;
+}
+
+.summary-task-event {
+  display: grid;
+  grid-template-columns: 7px 62px minmax(0, 1fr);
+  align-items: start;
+  gap: 7px;
+  color: var(--muted-strong);
+  line-height: 1.45;
+}
+
+.summary-task-event time {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.event-dot {
+  width: 7px;
+  height: 7px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: var(--blue);
+}
+
+.summary-task-event.success .event-dot {
+  background: var(--accent);
+}
+
+.summary-task-event.warning {
+  color: var(--amber);
+}
+
+.summary-task-event.warning .event-dot {
+  background: var(--amber);
+}
+
+.summary-task-event.error {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.summary-task-event.error .event-dot {
+  background: var(--danger);
 }
 
 .status-bar.error {
@@ -1321,16 +1396,23 @@ button:disabled {
   }
 
   .status-bar {
+    gap: 9px;
+  }
+
+  .status-main {
     flex-wrap: wrap;
   }
 
   .summary-task-progress {
-    width: 100%;
-    padding-left: 25px;
+    flex: 1 1 180px;
   }
 
   .summary-task-progress progress {
     flex: 1;
+  }
+
+  .summary-task-event {
+    grid-template-columns: 7px 54px minmax(0, 1fr);
   }
 
   .history-tools {

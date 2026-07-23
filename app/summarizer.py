@@ -26,7 +26,12 @@ SUMMARY_RETRY_MAX_CLAIMS_PER_ITEM = 2
 REVIEW_BATCH_MAX_ITEMS = 10
 FALLBACK_MAX_ITEMS = 60
 CHUNK_PARALLELISM = 4
-SUMMARY_PIPELINE_VERSION = 6
+FAST_CHUNK_MAX_MESSAGES = 250
+FAST_CHUNK_MAX_CHARS = 24000
+FAST_CHUNK_OUTPUT_MAX_CHARS = 1800
+FAST_FINAL_INPUT_MAX_CHARS = 60000
+FAST_CHUNK_PARALLELISM = 4
+SUMMARY_PIPELINE_VERSION = 7
 DEFAULT_SPECIAL_MEMBER_NAME = "魔女公主♪"
 EVIDENCE_TYPES = {
     "confirmed_fact",
@@ -65,6 +70,22 @@ class SummaryBlock:
     message_count: int
     time_range: str
     content: str
+
+
+ProgressCallback = Callable[[str, str, str, int, int, int], None]
+
+
+def _emit_progress(
+    callback: ProgressCallback | None,
+    stage: str,
+    level: str,
+    message: str,
+    current: int,
+    total: int,
+    percent: int,
+) -> None:
+    if callback:
+        callback(stage, level, message, current, total, min(max(percent, 0), 100))
 
 
 def _format_time(timestamp: int) -> str:
@@ -385,6 +406,98 @@ def build_review_summary_prompt(
 
 候选事件引用的原消息：
 {compact_messages(evidence_messages, max_chars=MERGE_MAX_CHARS)}
+""".strip()
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _format_fast_message_line(message: Message) -> str:
+    content = message.content.replace("\r\n", "\n").replace("\r", "\n").strip()
+    content = " / ".join(line.strip() for line in content.splitlines() if line.strip())
+    relations = []
+    if message.is_special_sender:
+        relations.append("重点成员本人")
+    if message.mentions_special:
+        relations.append("@重点成员")
+    if message.replies_to_special:
+        relations.append("回复重点成员")
+    relation_text = f"[{'/'.join(relations)}]" if relations else ""
+    alias = message.sender_alias or "发送者"
+    return f"[#{message.position}][{_format_time(message.timestamp)}][{alias}]{relation_text} {content}"
+
+
+def _compact_fast_messages(messages: list[Message], max_chars: int) -> str:
+    return compact_text(
+        "\n".join(_format_fast_message_line(message) for message in messages),
+        max_chars,
+        marker="\n\n...中间消息省略...\n\n",
+    )
+
+
+def build_fast_chunk_prompt(
+    group_name: str,
+    messages: list[Message],
+    chunk_index: int,
+    total_chunks: int,
+) -> list[dict[str, str]]:
+    system = (
+        "你是快速、保守的 QQ 群消息摘要助手。"
+        "只提炼原文明确出现的信息，不补充动机、风险、诊断或现实身份。"
+    )
+    user = f"""
+请快速总结 QQ 群「{group_name}」第 {chunk_index}/{total_chunks} 个分块。
+本块 {len(messages)} 条，时间范围：{_message_time_range(messages)}。
+
+输出要求：
+- 只输出简洁 Markdown，不输出 JSON、前言或结语，总长度控制在 1000-1500 个中文字符。
+- 保留 5-8 个最重要且彼此独立的话题；每条说明发生了什么，并保留 1-3 个 `#消息位置`。
+- 另列出原文明示的待办/决定；没有就写“无明确待办”。
+- 另列出与“重点成员”本人、@重点成员或回复重点成员直接相关的内容；没有就写“无”。
+- 可以使用输入中的成员编号指代发言者，但不能猜测或合并不同编号的身份。
+- 玩笑、刷屏、角色扮演必须明确标为玩笑，不能改写成真实计划、纠纷、求助或风险。
+- 图片、文件和转发的实际内容不可见，只能依据群友文字描述。
+
+聊天记录：
+{_compact_fast_messages(messages, FAST_CHUNK_MAX_CHARS)}
+""".strip()
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def build_fast_final_prompt(
+    group_name: str,
+    blocks: list[SummaryBlock],
+    total_message_count: int,
+    special_member_name: str,
+) -> list[dict[str, str]]:
+    block_text = compact_text(
+        _summary_blocks_text(blocks),
+        FAST_FINAL_INPUT_MAX_CHARS,
+        marker="\n\n...部分低优先级分块内容省略...\n\n",
+    )
+    system = (
+        "你是 QQ 群快速摘要整理助手。"
+        "只能压缩和去重输入分块摘要，不能加入分块中不存在的事实、计划、风险或身份。"
+    )
+    user = f"""
+请把 QQ 群「{group_name}」的 {len(blocks)} 个分块摘要整理为一份快速总结。
+原始消息总数：{total_message_count}。
+
+固定使用以下 Markdown 栏目：
+## 总览
+## 重点话题
+## 待办/决定
+## 需要关注
+## {special_member_name} 专属
+
+要求：
+- 总览保留 6-10 条最重要信息；重点话题保留 10-18 条，合并重复话题。
+- 只保留分块中明确出现的待办、决定、请求、担忧或未决分歧；没有就明确写“暂无”。
+- 玩笑和角色扮演不能升级为现实计划、纠纷、求助或风险。
+- 保留关键 `#消息位置` 作为定位线索；成员编号必须原样保留，不能合并不同编号。
+- “{special_member_name}”仅对应分块中的“重点成员”，不得通过昵称猜测身份。
+- 不要输出消息范围、处理过程、JSON、前言或结语，总长度控制在 3000-5000 个中文字符。
+
+分块摘要：
+{block_text}
 """.strip()
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -822,10 +935,46 @@ def render_summary(
             "## 消息范围",
             f"- 原始消息 {len(source_messages)} 条，其中有效文本消息 {len(summary_messages)} 条。",
             f"- 使用 {total_chunk_count} 个分块，时间范围：{time_range}。",
+            "- 总结模式：精细模式。",
             f"- 相邻消息最长间隔：{gap_minutes} 分 {gap_seconds} 秒（由程序计算）。",
         ]
     )
     return "\n".join(lines).strip()
+
+
+def _summary_range_lines(
+    summary_messages: list[Message],
+    source_messages: list[Message],
+    total_chunk_count: int,
+    mode_name: str,
+) -> list[str]:
+    range_messages = source_messages or summary_messages
+    max_gap_seconds = 0
+    if len(range_messages) > 1:
+        max_gap_seconds = max(
+            max(current.timestamp - previous.timestamp, 0)
+            for previous, current in zip(range_messages, range_messages[1:])
+        )
+    gap_minutes, gap_seconds = divmod(max_gap_seconds, 60)
+    return [
+        "## 消息范围",
+        f"- 原始消息 {len(source_messages)} 条，其中有效文本消息 {len(summary_messages)} 条。",
+        f"- 使用 {total_chunk_count} 个分块，时间范围：{_message_time_range(range_messages)}。",
+        f"- 总结模式：{mode_name}。",
+        f"- 相邻消息最长间隔：{gap_minutes} 分 {gap_seconds} 秒（由程序计算）。",
+    ]
+
+
+def _merge_operation_count(block_count: int, fan_in: int) -> int:
+    if block_count <= 1:
+        return 0
+    if block_count <= fan_in:
+        return 1
+    batch_sizes = [
+        min(fan_in, block_count - start)
+        for start in range(0, block_count, fan_in)
+    ]
+    return sum(size > 1 for size in batch_sizes) + _merge_operation_count(len(batch_sizes), fan_in)
 
 
 class DeepSeekClient:
@@ -868,6 +1017,7 @@ class DeepSeekClient:
         plan_callback: Callable[[int], None] | None = None,
         chunk_callback: Callable[[int, SummaryBlock], None] | None = None,
         stage_callback: Callable[[str], None] | None = None,
+        progress_callback: ProgressCallback | None = None,
         source_messages: list[Message] | None = None,
     ) -> str:
         if not self.api_key:
@@ -882,61 +1032,14 @@ class DeepSeekClient:
             len(messages) <= self.chunk_max_messages
             and _formatted_messages_chars(messages) <= self.single_call_max_chars
         )
-        if can_use_single_call:
-            if plan_callback:
-                plan_callback(1)
-            saved = saved_blocks.get(1)
-            if saved is not None:
-                payload = parse_summary_json(
-                    saved.content,
-                    {message.position for message in messages},
-                    self._special_positions(messages),
-                )
-                payload, special_payload = self._review_payload(
-                    group_name, payload, messages, stage_callback
-                )
-                return render_summary(
-                    payload,
-                    messages,
-                    source_messages,
-                    1,
-                    self.special_member_display_name,
-                    special_payload,
-                )
-            payload = self._chat_structured(
-                build_summary_prompt(
-                    group_name,
-                    messages,
-                    max_chars=self.single_call_max_chars,
-                    special_member_name=self.special_member_display_name,
-                ),
+        chunks = (
+            [messages]
+            if can_use_single_call
+            else split_messages(
                 messages,
-                operation="single summary",
+                max_messages=self.chunk_max_messages,
+                max_chars=self.chunk_max_chars,
             )
-            block = SummaryBlock(
-                title="完整摘要",
-                message_count=len(messages),
-                time_range=_message_time_range(messages),
-                content=summary_json_text(payload),
-            )
-            if chunk_callback:
-                chunk_callback(1, block)
-            payload, special_payload = self._review_payload(
-                group_name, payload, messages, stage_callback
-            )
-            return render_summary(
-                payload,
-                messages,
-                source_messages,
-                1,
-                self.special_member_display_name,
-                special_payload,
-            )
-
-        chunks = split_messages(
-            messages,
-            max_messages=self.chunk_max_messages,
-            max_chars=self.chunk_max_chars,
         )
         if len(chunks) == 1:
             if plan_callback:
@@ -948,8 +1051,17 @@ class DeepSeekClient:
                     {message.position for message in chunks[0]},
                     self._special_positions(chunks[0]),
                 )
+                _emit_progress(
+                    progress_callback,
+                    "summarizing",
+                    "success",
+                    "已恢复完成的分块 1/1。",
+                    1,
+                    1,
+                    60,
+                )
                 payload, special_payload = self._review_payload(
-                    group_name, payload, messages, stage_callback
+                    group_name, payload, messages, stage_callback, progress_callback
                 )
                 return render_summary(
                     payload,
@@ -959,16 +1071,37 @@ class DeepSeekClient:
                     self.special_member_display_name,
                     special_payload,
                 )
-            payload = self._chat_structured(
-                build_summary_prompt(
-                    group_name,
-                    chunks[0],
-                    max_chars=max(self.single_call_max_chars, self.chunk_max_chars),
-                    special_member_name=self.special_member_display_name,
-                ),
-                chunks[0],
-                operation="chunk 1/1",
+            _emit_progress(
+                progress_callback,
+                "summarizing",
+                "info",
+                "开始生成分块 1/1。",
+                0,
+                1,
+                0,
             )
+            try:
+                payload = self._chat_structured(
+                    build_summary_prompt(
+                        group_name,
+                        chunks[0],
+                        max_chars=max(self.single_call_max_chars, self.chunk_max_chars),
+                        special_member_name=self.special_member_display_name,
+                    ),
+                    chunks[0],
+                    operation="chunk 1/1",
+                )
+            except Exception:
+                _emit_progress(
+                    progress_callback,
+                    "summarizing",
+                    "error",
+                    "分块 1/1 生成失败，任务已停止。",
+                    0,
+                    1,
+                    0,
+                )
+                raise
             block = SummaryBlock(
                 title="完整摘要",
                 message_count=len(chunks[0]),
@@ -977,8 +1110,17 @@ class DeepSeekClient:
             )
             if chunk_callback:
                 chunk_callback(1, block)
+            _emit_progress(
+                progress_callback,
+                "summarizing",
+                "success",
+                "分块 1/1 已完成。",
+                1,
+                1,
+                60,
+            )
             payload, special_payload = self._review_payload(
-                group_name, payload, messages, stage_callback
+                group_name, payload, messages, stage_callback, progress_callback
             )
             return render_summary(
                 payload,
@@ -992,20 +1134,61 @@ class DeepSeekClient:
         if plan_callback:
             plan_callback(len(chunks))
 
-        def summarize_chunk(item: tuple[int, list[Message]]) -> SummaryBlock:
-            index, chunk = item
-            chunk_payload = self._chat_structured(
-                build_chunk_summary_prompt(
-                    group_name,
-                    chunk,
-                    chunk_index=index,
-                    total_chunks=len(chunks),
-                    max_chars=self.chunk_max_chars,
-                    special_member_name=self.special_member_display_name,
-                ),
-                chunk,
-                operation=f"chunk {index}/{len(chunks)}",
+        indexed_chunks = list(enumerate(chunks, start=1))
+        blocks_by_index = {
+            index: block
+            for index, block in saved_blocks.items()
+            if 1 <= index <= len(chunks)
+        }
+        completed_count = len(blocks_by_index)
+        completed_lock = threading.Lock()
+        if completed_count:
+            _emit_progress(
+                progress_callback,
+                "summarizing",
+                "success",
+                f"已恢复 {completed_count}/{len(chunks)} 个完成的分块。",
+                completed_count,
+                len(chunks),
+                round(60 * completed_count / len(chunks)),
             )
+
+        def summarize_chunk(item: tuple[int, list[Message]]) -> SummaryBlock:
+            nonlocal completed_count
+            index, chunk = item
+            _emit_progress(
+                progress_callback,
+                "summarizing",
+                "info",
+                f"开始生成分块 {index}/{len(chunks)}。",
+                completed_count,
+                len(chunks),
+                round(60 * completed_count / len(chunks)),
+            )
+            try:
+                chunk_payload = self._chat_structured(
+                    build_chunk_summary_prompt(
+                        group_name,
+                        chunk,
+                        chunk_index=index,
+                        total_chunks=len(chunks),
+                        max_chars=self.chunk_max_chars,
+                        special_member_name=self.special_member_display_name,
+                    ),
+                    chunk,
+                    operation=f"chunk {index}/{len(chunks)}",
+                )
+            except Exception:
+                _emit_progress(
+                    progress_callback,
+                    "summarizing",
+                    "error",
+                    f"分块 {index}/{len(chunks)} 生成失败，任务已停止。",
+                    completed_count,
+                    len(chunks),
+                    round(60 * completed_count / len(chunks)),
+                )
+                raise
             block = SummaryBlock(
                 title=f"第 {index}/{len(chunks)} 块",
                 message_count=len(chunk),
@@ -1014,14 +1197,20 @@ class DeepSeekClient:
             )
             if chunk_callback:
                 chunk_callback(index, block)
+            with completed_lock:
+                completed_count += 1
+                current = completed_count
+            _emit_progress(
+                progress_callback,
+                "summarizing",
+                "success",
+                f"分块 {index}/{len(chunks)} 已完成。",
+                current,
+                len(chunks),
+                round(60 * current / len(chunks)),
+            )
             return block
 
-        indexed_chunks = list(enumerate(chunks, start=1))
-        blocks_by_index = {
-            index: block
-            for index, block in saved_blocks.items()
-            if 1 <= index <= len(chunks)
-        }
         pending_chunks = [item for item in indexed_chunks if item[0] not in blocks_by_index]
         if pending_chunks:
             worker_count = min(self.chunk_parallelism, len(pending_chunks))
@@ -1034,15 +1223,22 @@ class DeepSeekClient:
         if stage_callback:
             stage_callback("merging")
 
+        merge_state = {
+            "current": 0,
+            "total": _merge_operation_count(len(blocks), min(self.merge_max_blocks, 3)),
+        }
+
         payload = self._merge_summary_blocks(
             group_name=group_name,
             blocks=blocks,
             total_message_count=len(messages),
             total_chunk_count=len(chunks),
             messages=messages,
+            progress_callback=progress_callback,
+            progress_state=merge_state,
         )
         payload, special_payload = self._review_payload(
-            group_name, payload, messages, stage_callback
+            group_name, payload, messages, stage_callback, progress_callback
         )
         return render_summary(
             payload,
@@ -1053,27 +1249,280 @@ class DeepSeekClient:
             special_payload,
         )
 
+    def summarize_fast(
+        self,
+        group_name: str,
+        messages: list[Message],
+        existing_blocks: dict[int, SummaryBlock] | None = None,
+        plan_callback: Callable[[int], None] | None = None,
+        chunk_callback: Callable[[int, SummaryBlock], None] | None = None,
+        stage_callback: Callable[[str], None] | None = None,
+        progress_callback: ProgressCallback | None = None,
+        source_messages: list[Message] | None = None,
+    ) -> str:
+        if not self.api_key:
+            raise SummarizerError("Missing DEEPSEEK_API_KEY environment variable")
+        if not messages:
+            raise SummarizerError("No messages to summarize")
+
+        messages = prepare_messages(messages, self.special_member_user_id)
+        source_messages = source_messages or messages
+        chunks = split_messages(
+            messages,
+            max_messages=FAST_CHUNK_MAX_MESSAGES,
+            max_chars=FAST_CHUNK_MAX_CHARS,
+        )
+        if plan_callback:
+            plan_callback(len(chunks))
+
+        indexed_chunks = list(enumerate(chunks, start=1))
+        saved_blocks = existing_blocks or {}
+        blocks_by_index = {
+            index: block
+            for index, block in saved_blocks.items()
+            if 1 <= index <= len(chunks)
+        }
+        completed_count = len(blocks_by_index)
+        completed_lock = threading.Lock()
+        if completed_count:
+            _emit_progress(
+                progress_callback,
+                "summarizing",
+                "success",
+                f"已恢复 {completed_count}/{len(chunks)} 个快速分块。",
+                completed_count,
+                len(chunks),
+                round(85 * completed_count / len(chunks)),
+            )
+
+        def summarize_fast_chunk(item: tuple[int, list[Message]]) -> SummaryBlock:
+            nonlocal completed_count
+            index, chunk = item
+            _emit_progress(
+                progress_callback,
+                "summarizing",
+                "info",
+                f"开始生成快速分块 {index}/{len(chunks)}。",
+                completed_count,
+                len(chunks),
+                round(85 * completed_count / len(chunks)),
+            )
+            try:
+                content = self._chat_text(
+                    build_fast_chunk_prompt(group_name, chunk, index, len(chunks)),
+                    max_tokens=2048,
+                )
+                if not content.strip():
+                    raise SummarizerError("DeepSeek returned an empty fast chunk summary")
+            except Exception:
+                _emit_progress(
+                    progress_callback,
+                    "summarizing",
+                    "error",
+                    f"快速分块 {index}/{len(chunks)} 生成失败，任务已停止。",
+                    completed_count,
+                    len(chunks),
+                    round(85 * completed_count / len(chunks)),
+                )
+                raise
+            block = SummaryBlock(
+                title=f"快速分块 {index}/{len(chunks)}",
+                message_count=len(chunk),
+                time_range=_message_time_range(chunk),
+                content=compact_text(
+                    content,
+                    FAST_CHUNK_OUTPUT_MAX_CHARS,
+                    marker="\n- ...其余低优先级内容省略...\n",
+                ),
+            )
+            if chunk_callback:
+                chunk_callback(index, block)
+            with completed_lock:
+                completed_count += 1
+                current = completed_count
+            _emit_progress(
+                progress_callback,
+                "summarizing",
+                "success",
+                f"快速分块 {index}/{len(chunks)} 已完成。",
+                current,
+                len(chunks),
+                round(85 * current / len(chunks)),
+            )
+            return block
+
+        pending_chunks = [item for item in indexed_chunks if item[0] not in blocks_by_index]
+        if pending_chunks:
+            worker_count = min(FAST_CHUNK_PARALLELISM, len(pending_chunks))
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="fast-summary-chunk",
+            ) as executor:
+                completed = list(executor.map(summarize_fast_chunk, pending_chunks))
+            for (index, _), block in zip(pending_chunks, completed):
+                blocks_by_index[index] = block
+
+        blocks = [blocks_by_index[index] for index in range(1, len(chunks) + 1)]
+        if stage_callback:
+            stage_callback("finalizing")
+        _emit_progress(
+            progress_callback,
+            "finalizing",
+            "info",
+            "正在整理快速模式最终总结。",
+            0,
+            1,
+            85,
+        )
+        try:
+            summary = self._chat_text(
+                build_fast_final_prompt(
+                    group_name,
+                    blocks,
+                    len(messages),
+                    self.special_member_display_name,
+                ),
+                max_tokens=4096,
+            )
+            if not summary.strip():
+                raise SummarizerError("DeepSeek returned an empty fast final summary")
+            _emit_progress(
+                progress_callback,
+                "finalizing",
+                "success",
+                "快速模式最终总结整理完成。",
+                1,
+                1,
+                98,
+            )
+        except SummarizerError as exc:
+            print(
+                f"Summary warning: fast finalization failed; using chunk summaries: {exc}",
+                flush=True,
+            )
+            summary = self._render_fast_fallback(blocks, self.special_member_display_name)
+            _emit_progress(
+                progress_callback,
+                "finalizing",
+                "warning",
+                "最终整理失败，已直接使用完成的快速分块生成结果。",
+                1,
+                1,
+                98,
+            )
+
+        summary = re.sub(r"\n##\s*消息范围[\s\S]*$", "", summary.strip()).strip()
+        if not re.search(r"^##\s*总览", summary, flags=re.MULTILINE):
+            summary = f"## 总览\n{summary}"
+        display_names = _display_names(messages, self.special_member_display_name)
+        display_names.setdefault("重点成员", self.special_member_display_name)
+        summary = _replace_aliases(summary, display_names)
+        required_sections = [
+            ("重点话题", "暂无更多重点话题。"),
+            ("待办/决定", "暂无明确待办。"),
+            ("需要关注", "暂无特别需要关注。"),
+            (f"{self.special_member_display_name} 专属", "暂无直接相关内容。"),
+        ]
+        for section_name, empty_text in required_sections:
+            if f"## {section_name}" not in summary:
+                summary = f"{summary}\n\n## {section_name}\n- {empty_text}"
+        return "\n".join(
+            [
+                summary,
+                "",
+                *_summary_range_lines(
+                    messages,
+                    source_messages,
+                    len(chunks),
+                    "快速模式",
+                ),
+            ]
+        ).strip()
+
+    @staticmethod
+    def _render_fast_fallback(blocks: list[SummaryBlock], special_member_name: str) -> str:
+        lines = [
+            "## 总览",
+            "- 最终整理请求未完成，以下按时间保留各分块已生成的要点。",
+            "",
+            "## 重点话题",
+        ]
+        for block in blocks:
+            lines.extend(
+                [
+                    f"### {block.title} · {block.time_range}",
+                    block.content.strip(),
+                    "",
+                ]
+            )
+        lines.extend(
+            [
+                "## 待办/决定",
+                "- 请结合上方分块中明确标记的待办与决定查看。",
+                "",
+                "## 需要关注",
+                "- 请结合上方分块中明确标记的请求、担忧与分歧查看。",
+                "",
+                f"## {special_member_name} 专属",
+                "- 请结合上方分块中明确标记的重点成员相关内容查看。",
+            ]
+        )
+        return "\n".join(lines).strip()
+
     def _review_payload(
         self,
         group_name: str,
         payload: dict[str, list[dict[str, Any]]],
         messages: list[Message],
         stage_callback: Callable[[str], None] | None,
+        progress_callback: ProgressCallback | None = None,
     ) -> tuple[
         dict[str, list[dict[str, Any]]],
         dict[str, list[dict[str, Any]]],
     ]:
         if not payload["items"]:
+            if stage_callback:
+                stage_callback("reviewing")
+            _emit_progress(
+                progress_callback,
+                "reviewing",
+                "success",
+                "没有需要复核的候选事件。",
+                1,
+                1,
+                98,
+            )
             return payload, {"items": []}
         if stage_callback:
             stage_callback("reviewing")
 
         topic_items, action_items, attention_items, special_items = _section_items(payload["items"])
+        section_items = [
+            ("重点话题", topic_items),
+            ("待办/决定", action_items),
+            ("需要关注", attention_items),
+            ("重点成员专属", special_items),
+        ]
+        review_total = sum(
+            (len(items) + REVIEW_BATCH_MAX_ITEMS - 1) // REVIEW_BATCH_MAX_ITEMS
+            for _, items in section_items
+        )
+        review_current = 0
+        _emit_progress(
+            progress_callback,
+            "reviewing",
+            "info",
+            f"开始栏目复核，共 {review_total} 批。",
+            0,
+            review_total,
+            82,
+        )
 
         def review_batches(
             section_name: str,
             items: list[dict[str, Any]],
         ) -> list[dict[str, Any]]:
+            nonlocal review_current
             reviewed_items: list[dict[str, Any]] = []
             total_batches = (len(items) + REVIEW_BATCH_MAX_ITEMS - 1) // REVIEW_BATCH_MAX_ITEMS
             for start in range(0, len(items), REVIEW_BATCH_MAX_ITEMS):
@@ -1081,6 +1530,16 @@ class DeepSeekClient:
                 batch_payload = {"items": batch_items}
                 batch_number = start // REVIEW_BATCH_MAX_ITEMS + 1
                 operation = f"review section={section_name} batch={batch_number}/{total_batches}"
+                next_batch = review_current + 1
+                _emit_progress(
+                    progress_callback,
+                    "reviewing",
+                    "info",
+                    f"正在复核“{section_name}”第 {batch_number}/{total_batches} 批。",
+                    next_batch,
+                    review_total,
+                    82 + round(16 * review_current / max(review_total, 1)),
+                )
                 allowed_positions = {
                     position
                     for item in batch_items
@@ -1111,12 +1570,32 @@ class DeepSeekClient:
                                 "Evidence review mixed evidence from different candidate events"
                             )
                     reviewed_items.extend(reviewed["items"])
+                    review_current += 1
+                    _emit_progress(
+                        progress_callback,
+                        "reviewing",
+                        "success",
+                        f"“{section_name}”第 {batch_number}/{total_batches} 批复核完成。",
+                        review_current,
+                        review_total,
+                        82 + round(16 * review_current / max(review_total, 1)),
+                    )
                 except SummarizerError as exc:
                     print(
                         f"Summary warning: {operation} failed; using validated candidates: {exc}",
                         flush=True,
                     )
                     reviewed_items.extend(batch_items)
+                    review_current += 1
+                    _emit_progress(
+                        progress_callback,
+                        "reviewing",
+                        "warning",
+                        f"“{section_name}”第 {batch_number}/{total_batches} 批复核失败，已保留校验过的候选结果。",
+                        review_current,
+                        review_total,
+                        82 + round(16 * review_current / max(review_total, 1)),
+                    )
             return reviewed_items
 
         main_items = [
@@ -1179,10 +1658,17 @@ class DeepSeekClient:
         total_chunk_count: int,
         messages: list[Message],
         level: int = 1,
+        progress_callback: ProgressCallback | None = None,
+        progress_state: dict[str, int] | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
         if not blocks:
             return {"items": []}
         fan_in = min(self.merge_max_blocks, 3)
+        if progress_state is None:
+            progress_state = {
+                "current": 0,
+                "total": _merge_operation_count(len(blocks), fan_in),
+            }
         if len(blocks) == 1:
             return parse_summary_json(
                 blocks[0].content,
@@ -1191,8 +1677,19 @@ class DeepSeekClient:
             )
         if len(blocks) <= fan_in:
             operation = f"merge level={level} final blocks={len(blocks)}"
+            next_batch = progress_state["current"] + 1
+            merge_total = max(progress_state["total"], 1)
+            _emit_progress(
+                progress_callback,
+                "merging",
+                "info",
+                f"正在合并第 {next_batch}/{merge_total} 批（第 {level} 层）。",
+                next_batch,
+                merge_total,
+                60 + round(22 * progress_state["current"] / merge_total),
+            )
             try:
-                return self._chat_structured(
+                merged = self._chat_structured(
                     build_merge_summary_prompt(
                         group_name=group_name,
                         blocks=blocks,
@@ -1206,12 +1703,34 @@ class DeepSeekClient:
                     source_blocks=blocks,
                     operation=operation,
                 )
+                progress_state["current"] += 1
+                _emit_progress(
+                    progress_callback,
+                    "merging",
+                    "success",
+                    f"合并第 {progress_state['current']}/{merge_total} 批完成。",
+                    progress_state["current"],
+                    merge_total,
+                    60 + round(22 * progress_state["current"] / merge_total),
+                )
+                return merged
             except SummarizerError as exc:
                 print(
                     f"Summary warning: {operation} failed; using programmatic merge: {exc}",
                     flush=True,
                 )
-                return self._merge_blocks_programmatically(blocks, messages)
+                merged = self._merge_blocks_programmatically(blocks, messages)
+                progress_state["current"] += 1
+                _emit_progress(
+                    progress_callback,
+                    "merging",
+                    "warning",
+                    f"合并第 {progress_state['current']}/{merge_total} 批失败，已使用本地合并继续。",
+                    progress_state["current"],
+                    merge_total,
+                    60 + round(22 * progress_state["current"] / merge_total),
+                )
+                return merged
 
         reduced_blocks: list[SummaryBlock] = []
         batches = [blocks[index : index + fan_in] for index in range(0, len(blocks), fan_in)]
@@ -1226,6 +1745,17 @@ class DeepSeekClient:
             }
             batch_messages = [message for message in messages if message.position in batch_positions]
             operation = f"merge level={level} batch={index}/{len(batches)} blocks={len(batch)}"
+            next_batch = progress_state["current"] + 1
+            merge_total = max(progress_state["total"], 1)
+            _emit_progress(
+                progress_callback,
+                "merging",
+                "info",
+                f"正在合并第 {next_batch}/{merge_total} 批（第 {level} 层）。",
+                next_batch,
+                merge_total,
+                60 + round(22 * progress_state["current"] / merge_total),
+            )
             try:
                 merged = self._chat_structured(
                     build_merge_summary_prompt(
@@ -1241,12 +1771,32 @@ class DeepSeekClient:
                     source_blocks=batch,
                     operation=operation,
                 )
+                progress_state["current"] += 1
+                _emit_progress(
+                    progress_callback,
+                    "merging",
+                    "success",
+                    f"合并第 {progress_state['current']}/{merge_total} 批完成。",
+                    progress_state["current"],
+                    merge_total,
+                    60 + round(22 * progress_state["current"] / merge_total),
+                )
             except SummarizerError as exc:
                 print(
                     f"Summary warning: {operation} failed; using programmatic merge: {exc}",
                     flush=True,
                 )
                 merged = self._merge_blocks_programmatically(batch, batch_messages)
+                progress_state["current"] += 1
+                _emit_progress(
+                    progress_callback,
+                    "merging",
+                    "warning",
+                    f"合并第 {progress_state['current']}/{merge_total} 批失败，已使用本地合并继续。",
+                    progress_state["current"],
+                    merge_total,
+                    60 + round(22 * progress_state["current"] / merge_total),
+                )
             reduced_blocks.append(
                 SummaryBlock(
                     title=f"合并块 {index}/{len(batches)}",
@@ -1263,6 +1813,8 @@ class DeepSeekClient:
             total_chunk_count=total_chunk_count,
             messages=messages,
             level=level + 1,
+            progress_callback=progress_callback,
+            progress_state=progress_state,
         )
 
     @staticmethod
@@ -1451,14 +2003,26 @@ class DeepSeekClient:
         raise SummarizerError(f"{operation}: Unable to validate DeepSeek summary JSON")
 
     def _chat(self, messages: list[dict[str, str]]) -> str:
+        return self._request_chat(messages, json_response=True, max_tokens=8192)
+
+    def _chat_text(self, messages: list[dict[str, str]], max_tokens: int) -> str:
+        return self._request_chat(messages, json_response=False, max_tokens=max_tokens)
+
+    def _request_chat(
+        self,
+        messages: list[dict[str, str]],
+        json_response: bool,
+        max_tokens: int,
+    ) -> str:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "temperature": 0.2,
-            "max_tokens": 8192,
+            "max_tokens": max_tokens,
             "stream": False,
-            "response_format": {"type": "json_object"},
         }
+        if json_response:
+            payload["response_format"] = {"type": "json_object"}
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),

@@ -29,6 +29,7 @@ from app.server import (
     query_bool,
     revoke_web_session,
     summarize_group_messages,
+    summary_task_payload,
     summary_message_from_record,
     webhook_token_matches,
 )
@@ -364,6 +365,65 @@ class AppTests(unittest.TestCase):
             self.assertIsNotNone(task["summary_id"])
             self.assertEqual(store.count_unread_message_records("1"), 0)
 
+    def test_manual_summary_task_selects_mode_from_actual_snapshot_size(self):
+        import app.server as server
+
+        class ModeFakeSummarizer:
+            def __init__(self):
+                self.calls = []
+
+            def _complete(self, mode, kwargs):
+                self.calls.append(mode)
+                kwargs["plan_callback"](1)
+                kwargs["progress_callback"](
+                    "finalizing",
+                    "success",
+                    "fake completed",
+                    1,
+                    1,
+                    98,
+                )
+                return "## 总览\n- fake"
+
+            def summarize(self, *args, **kwargs):
+                return self._complete("detailed", kwargs)
+
+            def summarize_fast(self, *args, **kwargs):
+                return self._complete("fast", kwargs)
+
+        for message_count, expected_mode in ((1000, "detailed"), (1001, "fast")):
+            with self.subTest(message_count=message_count), TemporaryDirectory() as tmp:
+                original_store = server.STORE
+                original_summarizer = server.SUMMARIZER
+                store = Store(Path(tmp) / "test.sqlite3")
+                store.init()
+                store.upsert_group("1", "test group", 100)
+                for index in range(message_count):
+                    store.save_message(
+                        Message(str(index), "1", "u1", "user", f"message {index}", 100 + index),
+                        {"message_id": index},
+                    )
+                store.create_summary_task("task-1", "1", 5000, True, 2000)
+                fake = ModeFakeSummarizer()
+
+                try:
+                    server.STORE = store
+                    server.SUMMARIZER = fake
+                    task = process_manual_summary_task("task-1")
+                finally:
+                    server.STORE = original_store
+                    server.SUMMARIZER = original_summarizer
+
+                self.assertEqual(task["status"], "completed")
+                self.assertEqual(task["mode"], expected_mode)
+                self.assertEqual(fake.calls, [expected_mode])
+                payload = summary_task_payload(
+                    task,
+                    store.list_summary_task_events("task-1"),
+                )
+                self.assertEqual(payload["progress_percent"], 100)
+                self.assertTrue(payload["events"])
+
     def test_manual_summary_task_resumes_without_repeating_saved_chunks(self):
         import app.server as server
 
@@ -595,6 +655,60 @@ class AppTests(unittest.TestCase):
                     for row in conn.execute("PRAGMA table_info(summary_tasks)").fetchall()
                 }
             self.assertTrue({"stage", "total_messages", "total_chunks", "completed_chunks"} <= columns)
+            self.assertTrue(
+                {
+                    "mode",
+                    "progress_percent",
+                    "phase_current",
+                    "phase_total",
+                    "phase_label",
+                }
+                <= columns
+            )
+
+    def test_store_tracks_summary_task_progress_and_events(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "test.sqlite3")
+            store.init()
+            store.upsert_group("1", "test group", 100)
+            store.create_summary_task("task-1", "1", 5000, True, 101)
+
+            store.set_summary_task_mode("task-1", "fast")
+            store.update_summary_task_progress(
+                "task-1",
+                stage="summarizing",
+                progress_percent=34,
+                phase_current=2,
+                phase_total=6,
+                phase_label="生成分块摘要",
+            )
+            store.add_summary_task_event(
+                "task-1",
+                level="info",
+                stage="summarizing",
+                message="开始第二批",
+                batch_current=2,
+                batch_total=6,
+                created_at=102,
+            )
+            store.add_summary_task_event(
+                "task-1",
+                level="warning",
+                stage="finalizing",
+                message="最终整理失败，已降级",
+                batch_current=1,
+                batch_total=1,
+                created_at=103,
+            )
+
+            task = store.get_summary_task("task-1")
+            events = store.list_summary_task_events("task-1")
+
+            self.assertEqual(task["mode"], "fast")
+            self.assertEqual(task["progress_percent"], 34)
+            self.assertEqual(task["phase_current"], 2)
+            self.assertEqual([event["level"] for event in events], ["info", "warning"])
+            self.assertEqual(events[-1]["message"], "最终整理失败，已降级")
 
     def test_store_group_auto_summary_defaults_off_and_can_toggle(self):
         with TemporaryDirectory() as tmp:
@@ -1670,6 +1784,71 @@ class AppTests(unittest.TestCase):
         summary = ActionMergeClient().summarize("test group", messages)
 
         self.assertIn("已决定", summary)
+
+    def test_detailed_summary_reports_chunk_merge_and_review_progress(self):
+        class ProgressClient(DeepSeekClient):
+            def __init__(self):
+                super().__init__(
+                    api_key="test",
+                    chunk_max_messages=2,
+                    chunk_max_chars=1000,
+                    merge_max_blocks=3,
+                    merge_max_chars=10000,
+                    chunk_parallelism=2,
+                )
+
+            def _chat(self, messages):
+                return EMPTY_SUMMARY_JSON
+
+        messages = [
+            Message(str(index), "1", "u1", "user", f"message {index}", 100 + index)
+            for index in range(5)
+        ]
+        progress_events = []
+
+        ProgressClient().summarize(
+            "test group",
+            messages,
+            progress_callback=lambda *event: progress_events.append(event),
+        )
+
+        stages = {event[0] for event in progress_events}
+        self.assertTrue({"summarizing", "merging", "reviewing"} <= stages)
+        self.assertTrue(any(event[1] == "success" for event in progress_events))
+        self.assertEqual(max(event[5] for event in progress_events), 98)
+
+    def test_fast_summary_falls_back_to_completed_chunks_when_final_call_fails(self):
+        class FastFallbackClient(DeepSeekClient):
+            def __init__(self):
+                super().__init__(api_key="test")
+
+            def _chat_text(self, messages, max_tokens):
+                prompt = messages[-1]["content"]
+                if "整理为一份快速总结" in prompt:
+                    raise SummarizerError("final request failed")
+                return "- **分块话题**：发送者讨论了本块内容 [#1]"
+
+        messages = [
+            Message(str(index), "1", f"u{index % 3}", f"user {index % 3}", f"message {index}", 100 + index)
+            for index in range(501)
+        ]
+        blocks = []
+        progress_events = []
+
+        with patch("builtins.print"):
+            summary = FastFallbackClient().summarize_fast(
+                "test group",
+                messages,
+                chunk_callback=lambda index, block: blocks.append((index, block)),
+                progress_callback=lambda *event: progress_events.append(event),
+            )
+
+        self.assertEqual(len(blocks), 3)
+        self.assertIn("最终整理请求未完成", summary)
+        self.assertIn("总结模式：快速模式", summary)
+        self.assertTrue(
+            any(event[0] == "finalizing" and event[1] == "warning" for event in progress_events)
+        )
 
 
 if __name__ == "__main__":

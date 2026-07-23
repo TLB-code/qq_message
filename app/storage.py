@@ -96,9 +96,14 @@ class Store:
                     mark_read INTEGER NOT NULL DEFAULT 1,
                     status TEXT NOT NULL,
                     stage TEXT NOT NULL DEFAULT 'queued',
+                    mode TEXT NOT NULL DEFAULT 'detailed',
                     total_messages INTEGER NOT NULL DEFAULT 0,
                     total_chunks INTEGER NOT NULL DEFAULT 0,
                     completed_chunks INTEGER NOT NULL DEFAULT 0,
+                    progress_percent INTEGER NOT NULL DEFAULT 0,
+                    phase_current INTEGER NOT NULL DEFAULT 0,
+                    phase_total INTEGER NOT NULL DEFAULT 0,
+                    phase_label TEXT NOT NULL DEFAULT '',
                     summary_id INTEGER,
                     message_count INTEGER,
                     error TEXT,
@@ -135,6 +140,21 @@ class Store:
                     PRIMARY KEY (task_id, chunk_index),
                     FOREIGN KEY (task_id) REFERENCES summary_tasks(task_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS summary_task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    level TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    batch_current INTEGER NOT NULL DEFAULT 0,
+                    batch_total INTEGER NOT NULL DEFAULT 0,
+                    message TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY (task_id) REFERENCES summary_tasks(task_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_summary_task_events_task_id
+                    ON summary_task_events(task_id, id);
                 """
             )
             group_columns = {
@@ -165,9 +185,14 @@ class Store:
             }
             task_column_migrations = {
                 "stage": "TEXT NOT NULL DEFAULT 'queued'",
+                "mode": "TEXT NOT NULL DEFAULT 'detailed'",
                 "total_messages": "INTEGER NOT NULL DEFAULT 0",
                 "total_chunks": "INTEGER NOT NULL DEFAULT 0",
                 "completed_chunks": "INTEGER NOT NULL DEFAULT 0",
+                "progress_percent": "INTEGER NOT NULL DEFAULT 0",
+                "phase_current": "INTEGER NOT NULL DEFAULT 0",
+                "phase_total": "INTEGER NOT NULL DEFAULT 0",
+                "phase_label": "TEXT NOT NULL DEFAULT ''",
                 "pipeline_version": "INTEGER NOT NULL DEFAULT 1",
             }
             for column_name, definition in task_column_migrations.items():
@@ -624,10 +649,20 @@ class Store:
                 """
                 UPDATE summary_tasks
                 SET status = 'running', stage = 'preparing',
+                    phase_current = 0, phase_total = 0, phase_label = '准备任务',
                     started_at = COALESCE(started_at, ?), error = NULL
                 WHERE task_id = ? AND status = 'queued'
                 """,
                 (started_at, task_id),
+            )
+
+    def set_summary_task_mode(self, task_id: str, mode: str) -> None:
+        if mode not in {"detailed", "fast"}:
+            raise ValueError("Unsupported summary task mode")
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE summary_tasks SET mode = ? WHERE task_id = ?",
+                (mode, task_id),
             )
 
     def save_summary_task_message_snapshot(
@@ -655,7 +690,8 @@ class Store:
             conn.execute(
                 """
                 UPDATE summary_tasks
-                SET total_messages = ?, stage = 'chunking'
+                SET total_messages = ?, stage = 'chunking',
+                    phase_current = 0, phase_total = 0, phase_label = '固定消息范围'
                 WHERE task_id = ?
                 """,
                 (len(records), task_id),
@@ -684,10 +720,12 @@ class Store:
                 SET stage = 'summarizing', total_chunks = ?,
                     completed_chunks = (
                         SELECT COUNT(*) FROM summary_task_chunks WHERE task_id = ?
-                    )
+                    ), phase_current = (
+                        SELECT COUNT(*) FROM summary_task_chunks WHERE task_id = ?
+                    ), phase_total = ?, phase_label = '生成分块摘要'
                 WHERE task_id = ?
                 """,
-                (total_chunks, task_id, task_id),
+                (total_chunks, task_id, task_id, total_chunks, task_id),
             )
 
     def save_summary_task_chunk(
@@ -729,10 +767,12 @@ class Store:
                 UPDATE summary_tasks
                 SET stage = 'summarizing', completed_chunks = (
                     SELECT COUNT(*) FROM summary_task_chunks WHERE task_id = ?
-                )
+                ), phase_current = (
+                    SELECT COUNT(*) FROM summary_task_chunks WHERE task_id = ?
+                ), phase_total = total_chunks, phase_label = '生成分块摘要'
                 WHERE task_id = ?
                 """,
-                (task_id, task_id),
+                (task_id, task_id, task_id),
             )
 
     def list_summary_task_chunks(self, task_id: str) -> list[dict[str, Any]]:
@@ -755,6 +795,82 @@ class Store:
                 (stage, task_id),
             )
 
+    def update_summary_task_progress(
+        self,
+        task_id: str,
+        stage: str,
+        progress_percent: int,
+        phase_current: int = 0,
+        phase_total: int = 0,
+        phase_label: str = "",
+    ) -> None:
+        progress = min(max(int(progress_percent), 0), 100)
+        current = max(int(phase_current), 0)
+        total = max(int(phase_total), 0)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE summary_tasks
+                SET stage = ?, progress_percent = ?, phase_current = ?,
+                    phase_total = ?, phase_label = ?
+                WHERE task_id = ?
+                """,
+                (stage, progress, current, total, phase_label[:120], task_id),
+            )
+
+    def add_summary_task_event(
+        self,
+        task_id: str,
+        level: str,
+        stage: str,
+        message: str,
+        created_at: int,
+        batch_current: int = 0,
+        batch_total: int = 0,
+    ) -> int:
+        if level not in {"info", "success", "warning", "error"}:
+            raise ValueError("Unsupported summary task event level")
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO summary_task_events (
+                    task_id, level, stage, batch_current, batch_total,
+                    message, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    level,
+                    stage,
+                    max(int(batch_current), 0),
+                    max(int(batch_total), 0),
+                    str(message)[:500],
+                    created_at,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def list_summary_task_events(self, task_id: str, limit: int = 80) -> list[dict[str, Any]]:
+        safe_limit = min(max(int(limit), 1), 200)
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, task_id, level, stage, batch_current, batch_total,
+                       message, created_at
+                FROM (
+                    SELECT id, task_id, level, stage, batch_current, batch_total,
+                           message, created_at
+                    FROM summary_task_events
+                    WHERE task_id = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                )
+                ORDER BY id ASC
+                """,
+                (task_id, safe_limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def complete_summary_task(
         self,
         task_id: str,
@@ -767,7 +883,8 @@ class Store:
                 """
                 UPDATE summary_tasks
                 SET status = 'completed', stage = 'completed', summary_id = ?, message_count = ?,
-                    error = NULL, completed_at = ?
+                    progress_percent = 100, phase_current = 1, phase_total = 1,
+                    phase_label = '已完成', error = NULL, completed_at = ?
                 WHERE task_id = ?
                 """,
                 (summary_id, message_count, completed_at, task_id),
@@ -780,7 +897,8 @@ class Store:
             conn.execute(
                 """
                 UPDATE summary_tasks
-                SET status = 'failed', stage = 'failed', error = ?, completed_at = ?
+                SET status = 'failed', stage = 'failed', phase_label = '任务失败',
+                    error = ?, completed_at = ?
                 WHERE task_id = ?
                 """,
                 (error, completed_at, task_id),
@@ -791,7 +909,7 @@ class Store:
             conn.execute(
                 """
                 UPDATE summary_tasks
-                SET status = 'queued', stage = 'resuming', error = NULL
+                SET status = 'queued', stage = 'resuming', phase_label = '恢复任务', error = NULL
                 WHERE status = 'running'
                 """
             )
@@ -812,7 +930,10 @@ class Store:
                     """
                     UPDATE summary_tasks
                     SET pipeline_version = ?, stage = 'resuming', total_chunks = 0,
-                        completed_chunks = 0, error = NULL
+                        completed_chunks = 0, progress_percent = 0,
+                        phase_current = 0, phase_total = 0, phase_label = '恢复任务',
+                        mode = CASE WHEN total_messages > 1000 THEN 'fast' ELSE 'detailed' END,
+                        error = NULL
                     WHERE task_id = ?
                     """,
                     [(pipeline_version, task_id) for task_id in incompatible_ids],
@@ -1111,7 +1232,8 @@ class Store:
                     UPDATE summary_tasks
                     SET status = 'completed', stage = 'completed',
                         summary_id = ?, message_count = ?, error = NULL,
-                        completed_at = ?
+                        progress_percent = 100, phase_current = 1, phase_total = 1,
+                        phase_label = '已完成', completed_at = ?
                     WHERE task_id = ?
                     """,
                     (summary_id, len(messages), created_at, task_id),

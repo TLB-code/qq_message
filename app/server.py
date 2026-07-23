@@ -51,6 +51,7 @@ WEBHOOK_LOG_PATH = SETTINGS.database_path.parent / "webhook_events.log"
 DEFAULT_SUMMARY_LIMIT = 5000
 MAX_SUMMARY_LIMIT = 5000
 AUTO_SUMMARY_BATCH_LIMIT = 500
+DETAILED_SUMMARY_MAX_MESSAGES = 1000
 DEFAULT_HISTORY_LIMIT = 50
 MAX_HISTORY_LIMIT = 100
 DEFAULT_UNREAD_LIMIT = 100
@@ -219,23 +220,48 @@ def parse_manual_summary_limit(value: object) -> int:
     return limit
 
 
-def summary_task_payload(task: dict) -> dict:
+def summary_task_payload(task: dict, events: list[dict] | None = None) -> dict:
     return {
         "task_id": str(task["task_id"]),
         "group_id": str(task["group_id"]),
         "requested_limit": int(task["requested_limit"]),
         "status": str(task["status"]),
         "stage": str(task.get("stage") or task["status"]),
+        "mode": str(task.get("mode") or "detailed"),
         "total_messages": int(task.get("total_messages") or 0),
         "total_chunks": int(task.get("total_chunks") or 0),
         "completed_chunks": int(task.get("completed_chunks") or 0),
+        "progress_percent": int(task.get("progress_percent") or 0),
+        "phase_current": int(task.get("phase_current") or 0),
+        "phase_total": int(task.get("phase_total") or 0),
+        "phase_label": str(task.get("phase_label") or ""),
         "summary_id": task.get("summary_id"),
         "message_count": task.get("message_count"),
         "error": task.get("error"),
         "created_at": int(task["created_at"]),
         "started_at": task.get("started_at"),
         "completed_at": task.get("completed_at"),
+        "events": [
+            {
+                "id": int(event["id"]),
+                "level": str(event["level"]),
+                "stage": str(event["stage"]),
+                "batch_current": int(event.get("batch_current") or 0),
+                "batch_total": int(event.get("batch_total") or 0),
+                "message": str(event["message"]),
+                "created_at": int(event["created_at"]),
+            }
+            for event in (events or [])
+        ],
     }
+
+
+def public_summary_error(exc: Exception) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    for secret in (SETTINGS.deepseek_api_key, SETTINGS.webhook_token, SETTINGS.web_password):
+        if secret:
+            message = message.replace(secret, "***")
+    return message[:500]
 
 
 def web_auth_enabled() -> bool:
@@ -397,6 +423,13 @@ def process_manual_summary_task(task_id: str) -> dict | None:
 
     try:
         STORE.mark_summary_task_running(task_id, int(time.time()))
+        STORE.add_summary_task_event(
+            task_id,
+            level="info",
+            stage="preparing",
+            message="后台任务开始执行。",
+            created_at=int(time.time()),
+        )
         lock = summary_lock_for_group(str(task["group_id"]))
         with lock:
             records = STORE.list_summary_task_message_records(task_id)
@@ -414,6 +447,27 @@ def process_manual_summary_task(task_id: str) -> dict | None:
             expected_records = int(refreshed_task.get("total_messages") or len(records))
             if len(records) != expected_records:
                 raise ValueError("Some messages in the summary task snapshot are no longer available")
+
+            summary_mode = (
+                "detailed"
+                if len(records) <= DETAILED_SUMMARY_MAX_MESSAGES
+                else "fast"
+            )
+            STORE.set_summary_task_mode(task_id, summary_mode)
+            mode_label = "精细模式" if summary_mode == "detailed" else "快速模式"
+            STORE.update_summary_task_progress(
+                task_id,
+                stage="preparing",
+                progress_percent=0,
+                phase_label="准备总结",
+            )
+            STORE.add_summary_task_event(
+                task_id,
+                level="info",
+                stage="preparing",
+                message=f"已固定 {len(records)} 条消息，使用{mode_label}。",
+                created_at=int(time.time()),
+            )
 
             group = STORE.get_group(str(task["group_id"]))
             if not group:
@@ -450,20 +504,90 @@ def process_manual_summary_task(task_id: str) -> dict | None:
                         completed_at=int(time.time()),
                     )
 
-                summary = SUMMARIZER.summarize(
+                phase_labels = {
+                    "summarizing": "生成分块摘要",
+                    "merging": "树状合并摘要",
+                    "reviewing": "分栏目复核",
+                    "finalizing": "整理最终总结",
+                }
+
+                def save_progress(
+                    stage: str,
+                    level: str,
+                    message: str,
+                    current: int,
+                    total: int,
+                    percent: int,
+                ) -> None:
+                    STORE.update_summary_task_progress(
+                        task_id,
+                        stage=stage,
+                        progress_percent=percent,
+                        phase_current=current,
+                        phase_total=total,
+                        phase_label=phase_labels.get(stage, stage),
+                    )
+                    STORE.add_summary_task_event(
+                        task_id,
+                        level=level,
+                        stage=stage,
+                        message=message,
+                        batch_current=current,
+                        batch_total=total,
+                        created_at=int(time.time()),
+                    )
+
+                summarize_method = (
+                    SUMMARIZER.summarize
+                    if summary_mode == "detailed"
+                    else SUMMARIZER.summarize_fast
+                )
+                summary = summarize_method(
                     str(group["group_name"]),
                     summary_messages,
                     existing_blocks=saved_blocks,
                     plan_callback=save_plan,
                     chunk_callback=save_chunk,
                     stage_callback=lambda stage: STORE.set_summary_task_stage(task_id, stage),
+                    progress_callback=save_progress,
                     source_messages=messages,
                 )
             else:
                 STORE.set_summary_task_plan(task_id, 0)
                 summary = MEDIA_ONLY_SUMMARY
+                STORE.update_summary_task_progress(
+                    task_id,
+                    stage="finalizing",
+                    progress_percent=98,
+                    phase_current=1,
+                    phase_total=1,
+                    phase_label="整理最终总结",
+                )
+                STORE.add_summary_task_event(
+                    task_id,
+                    level="success",
+                    stage="finalizing",
+                    message="本批只有媒体消息，已生成媒体提示摘要。",
+                    batch_current=1,
+                    batch_total=1,
+                    created_at=int(time.time()),
+                )
 
-            STORE.set_summary_task_stage(task_id, "saving")
+            STORE.update_summary_task_progress(
+                task_id,
+                stage="saving",
+                progress_percent=99,
+                phase_current=0,
+                phase_total=1,
+                phase_label="保存总结",
+            )
+            STORE.add_summary_task_event(
+                task_id,
+                level="info",
+                stage="saving",
+                message="最终总结已生成，正在保存。",
+                created_at=int(time.time()),
+            )
             summary_id = STORE.save_summary(
                 group_id=str(task["group_id"]),
                 messages=messages,
@@ -473,15 +597,32 @@ def process_manual_summary_task(task_id: str) -> dict | None:
                 mark_read=bool(task["mark_read"]),
                 task_id=task_id,
             )
+            STORE.add_summary_task_event(
+                task_id,
+                level="success",
+                stage="completed",
+                message=f"总结已完成，共处理 {len(messages)} 条消息。",
+                batch_current=1,
+                batch_total=1,
+                created_at=int(time.time()),
+            )
             result = {
                 "summary_id": summary_id,
                 "message_count": len(messages),
             }
         enqueue_auto_summary_if_needed(str(task["group_id"]))
     except Exception as exc:
+        error_message = public_summary_error(exc)
         current_task = STORE.get_summary_task(task_id)
         if not current_task or current_task["status"] != "completed":
-            STORE.fail_summary_task(task_id, str(exc), int(time.time()))
+            STORE.fail_summary_task(task_id, error_message, int(time.time()))
+            STORE.add_summary_task_event(
+                task_id,
+                level="error",
+                stage="failed",
+                message=f"任务失败：{error_message}",
+                created_at=int(time.time()),
+            )
         print(f"Manual summary task {task_id} failed: {exc}")
     return STORE.get_summary_task(task_id)
 
@@ -752,7 +893,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             task = STORE.get_active_summary_task(group_id)
             self._json(
                 HTTPStatus.OK,
-                {"task": summary_task_payload(task) if task else None},
+                {
+                    "task": summary_task_payload(
+                        task,
+                        STORE.list_summary_task_events(str(task["task_id"])),
+                    )
+                    if task
+                    else None
+                },
             )
             return
 
@@ -760,7 +908,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         if not task:
             self._json(HTTPStatus.NOT_FOUND, {"error": "Summary task not found"})
             return
-        self._json(HTTPStatus.OK, {"task": summary_task_payload(task)})
+        self._json(
+            HTTPStatus.OK,
+            {
+                "task": summary_task_payload(
+                    task,
+                    STORE.list_summary_task_events(str(task["task_id"])),
+                )
+            },
+        )
 
     def _handle_unread_get(self, group_id: str, query: dict[str, list[str]]) -> None:
         group = STORE.get_group(group_id)
@@ -1052,14 +1208,25 @@ class RequestHandler(BaseHTTPRequestHandler):
             pipeline_version=SUMMARY_PIPELINE_VERSION,
         )
         if created:
+            STORE.add_summary_task_event(
+                str(task["task_id"]),
+                level="info",
+                stage="queued",
+                message="总结任务已进入后台队列。",
+                created_at=int(time.time()),
+            )
             MANUAL_SUMMARY_QUEUE.put(str(task["task_id"]))
+            task = STORE.get_summary_task(str(task["task_id"])) or task
 
         self._json(
             HTTPStatus.ACCEPTED,
             {
                 "ok": True,
                 "created": created,
-                "task": summary_task_payload(task),
+                "task": summary_task_payload(
+                    task,
+                    STORE.list_summary_task_events(str(task["task_id"])),
+                ),
             },
         )
 
