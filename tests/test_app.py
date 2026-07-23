@@ -1158,6 +1158,29 @@ class AppTests(unittest.TestCase):
         self.assertIn('"explicit_concern"', client.calls[1][-2]["content"])
         self.assertIn("必须按各自直接证据拆成", client.calls[1][-1]["content"])
 
+    def test_invalid_json_retry_requests_a_smaller_fresh_result(self):
+        class TruncatedClient(DeepSeekClient):
+            def __init__(self):
+                super().__init__(api_key="test")
+                self.calls = []
+
+            def _chat(self, messages):
+                self.calls.append(messages)
+                if len(self.calls) == 1:
+                    return '{"items":[{"title":"被截断"'
+                return json.dumps({"items": []})
+
+        client = TruncatedClient()
+        payload = client._chat_structured(
+            [{"role": "user", "content": "合并摘要"}],
+            [Message("1", "1", "u1", "甲", "消息", 100)],
+        )
+
+        self.assertEqual(payload, {"items": []})
+        self.assertEqual([message["role"] for message in client.calls[1]], ["user", "user"])
+        self.assertIn("最多输出 20 个事件", client.calls[1][-1]["content"])
+        self.assertIn("不要续写", client.calls[1][-1]["content"])
+
     def test_confirmed_plan_is_programmatically_routed_as_open(self):
         payload = {
             "items": [

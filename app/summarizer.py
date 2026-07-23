@@ -18,6 +18,10 @@ CHUNK_MAX_MESSAGES = 250
 CHUNK_MAX_CHARS = 12000
 MERGE_MAX_BLOCKS = 12
 MERGE_MAX_CHARS = 18000
+SUMMARY_MAX_ITEMS = 30
+SUMMARY_MAX_CLAIMS_PER_ITEM = 3
+SUMMARY_RETRY_MAX_ITEMS = 20
+SUMMARY_RETRY_MAX_CLAIMS_PER_ITEM = 2
 CHUNK_PARALLELISM = 4
 SUMMARY_PIPELINE_VERSION = 3
 DEFAULT_SPECIAL_MEMBER_NAME = "魔女公主♪"
@@ -266,6 +270,7 @@ def build_chunk_summary_prompt(
 - 昵称可能是角色扮演，不得映射到现实同名人物；不得改变原词含义，例如“黄油”不能写成“黄图”。
 - “成员009”是系统别名，与昵称文字“009”完全不同；涉及成员时只能使用消息行方括号中的成员别名。
 - 不要输出 participants，参与者由程序根据每条 claim 的证据发送者生成。
+- 最多输出 {SUMMARY_MAX_ITEMS} 个事件，每个事件最多 {SUMMARY_MAX_CLAIMS_PER_ITEM} 条 claim；优先保留主要事件、明确计划、明确担忧和重点成员相关事件。
 - 每条 claim 必须只引用直接支持自身文字的 1-5 条消息，不要加入仅仅时间相近的其他话题。
 - 看不到图片、转发和文件的实际内容，只能写群友文字中明确表达的信息。
 - 带“重点成员本人”“@重点成员”或“回复重点成员”的消息需要作为独立事件保留；“{special_member_name}”只是显示名。
@@ -320,6 +325,7 @@ def build_merge_summary_prompt(
 - action_state、attention_reason 只能沿用输入已有状态或降级为 none，不得自行升级。
 - 不要输出参与者、状态描述、总览或 Markdown。
 - 重点成员身份只能由原事件的证据标记继承，不得根据昵称识别。“{special_member_name}”仅为显示名。
+- 最多输出 {SUMMARY_MAX_ITEMS} 个事件，每个事件最多 {SUMMARY_MAX_CLAIMS_PER_ITEM} 条 claim；优先合并重复内容，不要为同一话题创建多个近似事件。
 - 每个 claim 保留 1-5 个最直接证据；删除重复事件，但不要漏掉跨多个分块持续发生的主要事件。
 """.strip()
 
@@ -1237,13 +1243,18 @@ class DeepSeekClient:
             except SummarizerError as exc:
                 last_error = exc
                 if attempt < 2:
-                    prompt = [
-                        *messages,
-                        {"role": "assistant", "content": raw},
-                        {
-                            "role": "user",
-                            "content": (
-                                f"上次输出未通过校验：{exc}。"
+                    invalid_json = str(exc) == "DeepSeek did not return valid summary JSON"
+                    correction = (
+                        f"上次输出未通过校验：{exc}。"
+                        + (
+                            "上次 JSON 可能因输出过长而被截断，请不要续写，也不要复述上次输出；"
+                            "请从原输入重新生成更紧凑且完整闭合的 JSON。"
+                            f"最多输出 {SUMMARY_RETRY_MAX_ITEMS} 个事件，每个事件最多 "
+                            f"{SUMMARY_RETRY_MAX_CLAIMS_PER_ITEM} 条 claim，每条 claim 最多保留 3 个"
+                            "最直接证据。合并重复或相近事件，优先保留主要事件、明确计划、明确担忧"
+                            "和重点成员相关事件。"
+                            if invalid_json
+                            else (
                                 "请直接修正上面的 JSON，并重新输出完整结果。"
                                 "attention_reason=explicit_concern 只能搭配 type=reported_concern；"
                                 "如果一个条目混合了成员自述和他人明确担忧，必须按各自直接证据拆成"
@@ -1251,11 +1262,14 @@ class DeepSeekClient:
                                 "attention_reason=unresolved_disagreement 只能搭配 type=disagreement。"
                                 "不得为了通过校验而升级、替换或编造证据类型；合并阶段只能沿用来源"
                                 "条目已有的 type、action_state 和 attention_reason。"
-                                "请同时精简重复条目，重新输出合法且证据位置正确的 JSON，"
-                                "并确保 JSON 在输出上限内完整结束。"
-                            ),
-                        },
-                    ]
+                            )
+                        )
+                        + "只输出合法、证据位置正确且在输出上限内完整结束的 JSON。"
+                    )
+                    prompt = list(messages)
+                    if not invalid_json:
+                        prompt.append({"role": "assistant", "content": raw})
+                    prompt.append({"role": "user", "content": correction})
         raise last_error or SummarizerError("Unable to validate DeepSeek summary JSON")
 
     def _chat(self, messages: list[dict[str, str]]) -> str:
