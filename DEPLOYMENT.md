@@ -54,13 +54,168 @@ Linux 用户：当前登录用户
 
 下面的命令会直接使用你的域名 `message.tanlb.xyz`。
 
+## 1.1 从旧服务器迁移到新服务器
+
+如果这是第一次部署，可以跳到“1. 准备服务器”。如果旧服务器即将到期，并且需要保留现有消息、总结历史、已读游标、群自动总结开关和后台任务断点，必须先完成本节。
+
+迁移时需要保留的核心数据：
+
+```text
+/opt/qq_message/data/qq_summary.sqlite3
+/opt/qq_message/.env
+NapCat 登录状态和 HTTP Client 配置，或准备在新服务器重新登录并配置
+```
+
+`qq_summary.sqlite3` 已经包含消息、总结、群配置、手动总结任务、消息快照和分块检查点。不要只克隆 GitHub 仓库，仓库里不包含数据库和 `.env`。
+
+### 迁移前准备
+
+1. 确认本地最新代码已经提交并推送到 GitHub。
+2. 在 DNS 服务商处把 `message.tanlb.xyz` 的 TTL 提前降低到 `300` 秒左右。
+3. 记录旧服务器和新服务器 IP。
+4. 在新服务器完成本文第 1-8 节，但先不要停止旧服务器，也不要启动新服务器上的 NapCat。
+5. 暂时不要在新服务器执行 Certbot；域名仍指向旧服务器时，HTTP 验证通常无法通过。
+
+在旧服务器确认当前版本和任务状态：
+
+```bash
+cd /opt/qq_message
+git rev-parse HEAD
+sudo systemctl status qq-message --no-pager
+
+sqlite3 data/qq_summary.sqlite3 \
+  "SELECT task_id, group_id, status, stage, completed_chunks, total_chunks FROM summary_tasks WHERE status IN ('queued', 'running');"
+```
+
+如果有总结任务，优先等待任务完成。必须中途迁移时也可以继续：数据库里的消息快照和已完成分块会一起迁移，新服务器启动后会重新入队，只补做未完成分块。
+
+### 最终数据切换
+
+为了避免数据库复制期间仍有新消息写入，先停止旧服务器的 NapCat，再停止后端。NapCat 如果由 systemd 管理：
+
+```bash
+sudo systemctl stop napcat
+sudo systemctl stop qq-message
+```
+
+如果 NapCat 仍在 `screen` 中运行：
+
+```bash
+screen -ls
+screen -r napcat
+```
+
+进入会话后正常停止 NapCat，再退出 `screen`。从此时到新服务器 NapCat 上线之间的消息可能无法由 webhook 实时接收，因此应尽量缩短这段时间。
+
+旧服务器停止写入后，创建最终迁移文件：
+
+```bash
+cd /opt/qq_message
+mkdir -p migration
+
+cp -a data/qq_summary.sqlite3 migration/qq_summary.sqlite3
+cp -a .env migration/qq-message.env
+chmod 600 migration/qq-message.env
+
+sha256sum migration/qq_summary.sqlite3 migration/qq-message.env
+ls -lh migration/
+```
+
+在新服务器拉取迁移文件，将 `旧服务器IP` 替换为实际地址：
+
+```bash
+sudo systemctl stop qq-message 2>/dev/null || true
+mkdir -p /opt/qq_message/data
+
+scp root@旧服务器IP:/opt/qq_message/migration/qq_summary.sqlite3 /opt/qq_message/data/qq_summary.sqlite3
+scp root@旧服务器IP:/opt/qq_message/migration/qq-message.env /opt/qq_message/.env
+
+chmod 600 /opt/qq_message/.env
+chown -R $(whoami):$(whoami) /opt/qq_message/data /opt/qq_message/.env
+sha256sum /opt/qq_message/data/qq_summary.sqlite3 /opt/qq_message/.env
+sqlite3 /opt/qq_message/data/qq_summary.sqlite3 "PRAGMA quick_check;"
+```
+
+对比新旧服务器的 SHA256，`PRAGMA quick_check` 应输出 `ok`。数据库文件必须完全一致；`.env` 复制后不要把内容发到聊天或日志中。
+
+启动新服务器后端并观察数据库迁移、任务恢复日志：
+
+```bash
+sudo systemctl start qq-message
+sudo journalctl -u qq-message -f
+```
+
+看到下面类似日志后再继续：
+
+```text
+QQ Message Summary running at http://127.0.0.1:8000
+Resumed N manual summary task(s)
+```
+
+### 迁移 NapCat
+
+推荐在新服务器重新安装 NapCat 并重新扫码登录，不要直接复制旧服务器的 QQ 程序目录。新服务器登录成功后，重新创建 HTTP Client：
+
+```text
+http://127.0.0.1:8000/webhook/onebot?token=与迁移后的.env完全一致的QQ_SUMMARY_WEBHOOK_TOKEN
+```
+
+同一个 QQ 不建议在两台服务器的 NapCat 中同时运行。确认旧 NapCat 已停止后，再登录新 NapCat。
+
+### 切换域名和 HTTPS
+
+先在本地电脑临时验证新服务器的 HTTP Nginx，其中 `新服务器IP` 替换为实际地址：
+
+```bash
+curl --resolve message.tanlb.xyz:80:新服务器IP http://message.tanlb.xyz/api/auth/status
+```
+
+确认返回认证状态后，在 DNS 服务商处把 `message.tanlb.xyz` 的 A 记录改为新服务器 IP。检查解析：
+
+```bash
+dig +short message.tanlb.xyz
+```
+
+解析到新服务器后，再在新服务器申请证书：
+
+```bash
+sudo certbot --nginx -d message.tanlb.xyz
+sudo certbot renew --dry-run
+```
+
+如果域名使用 Cloudflare 橙云代理，`dig` 可能显示 Cloudflare IP，而不是源服务器 IP。迁移时可以暂时把记录改为“仅 DNS / 灰云”，确认新服务器和证书正常后再重新开启代理；或者直接在 Cloudflare 控制台确认源站 A 记录已经改为新服务器。
+
+最终检查：
+
+```bash
+curl -I https://message.tanlb.xyz
+sudo systemctl status qq-message nginx --no-pager
+sudo journalctl -u qq-message -n 100 --no-pager
+```
+
+浏览器使用 `Ctrl+F5` 强制刷新，确认历史消息、总结数量和群自动总结开关都存在。旧服务器至少保留到新服务器稳定运行并完成一次消息接收和总结测试后再释放。
+
+### 迁移回退
+
+如果新服务器出现问题：
+
+1. 停止新服务器 NapCat 和 `qq-message`。
+2. 把 DNS A 记录切回旧服务器 IP。
+3. 启动旧服务器 `qq-message` 和 NapCat。
+4. 不要让新旧 NapCat 同时登录。
+
+新服务器切换后收到的消息不会自动合并回旧数据库，因此回退决定应尽早做，并保留新服务器数据库用于后续人工合并或再次迁移。
+
 ## 2. 安装系统依赖
 
 登录服务器后执行：
 
 ```bash
 sudo apt update
-sudo apt install -y git python3 python3-venv python3-pip nodejs npm nginx curl
+sudo apt install -y git python3 python3-venv python3-pip nginx curl ca-certificates gnupg sqlite3 rsync dnsutils
+
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
 ```
 
 检查版本：
@@ -72,7 +227,13 @@ npm --version
 nginx -v
 ```
 
-建议 Python 使用 3.11 或更高版本。Ubuntu 22.04 默认 Python 可能是 3.10，一般也能运行；如果遇到语法或兼容问题，再升级 Python。
+项目使用 Vite 6，Node.js 必须是 18、20 或 22 以上版本，推荐 Node.js 20 LTS。不要直接使用 Ubuntu 22.04 仓库中的旧版 Node.js。可以额外验证：
+
+```bash
+node -e "const major=Number(process.versions.node.split('.')[0]); if(major<18){process.exit(1)}; console.log('Node.js version OK')"
+```
+
+建议 Python 使用 3.11 或更高版本。Ubuntu 22.04 默认 Python 3.10 也可以运行当前项目。
 
 ## 3. 拉取项目代码
 
@@ -124,6 +285,8 @@ QQ_SUMMARY_WEB_PASSWORD=换成一个网页登录密码
 
 QQ_SUMMARY_AUTO_SUMMARY_ENABLED=true
 QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD=500
+QQ_SUMMARY_SPECIAL_MEMBER_USER_ID=重点成员的QQ号
+QQ_SUMMARY_SPECIAL_MEMBER_DISPLAY_NAME=魔女公主♪
 ```
 
 保存后设置权限，避免其他用户直接读取密钥：
@@ -146,7 +309,9 @@ chmod 600 /opt/qq_message/.env
 | `QQ_SUMMARY_WEBHOOK_TOKEN` | 强烈建议填写 | NapCat 调用 webhook 的校验 token，防止别人伪造消息推送。 |
 | `QQ_SUMMARY_WEB_PASSWORD` | 强烈建议填写 | 网页登录密码。服务器部署时必须设置，否则网页接口会裸露在公网。 |
 | `QQ_SUMMARY_AUTO_SUMMARY_ENABLED` | 建议 `true` | 全局自动总结开关。还需要在网页里给具体群开启自动总结。 |
-| `QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD` | 建议 `500` | 自动总结阈值。某个群未读消息达到这个数量后，后台自动总结一批。 |
+| `QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD` | 建议 `500` | 自动总结触发阈值。达到阈值后，后台固定每批最多总结 500 条；它不改变手动总结上限。 |
+| `QQ_SUMMARY_SPECIAL_MEMBER_USER_ID` | 建议填写 | 专属总结使用的 QQ `user_id`。昵称或群名片修改后仍可识别，也不会把相似昵称或带“伪”的昵称算作本人。 |
+| `QQ_SUMMARY_SPECIAL_MEMBER_DISPLAY_NAME` | 可选 | 专属总结标题中的显示名称，默认是 `魔女公主♪`，不参与身份判断。 |
 
 ## 5. 构建前端
 
@@ -221,7 +386,8 @@ sudo nano /etc/systemd/system/qq-message.service
 ```ini
 [Unit]
 Description=QQ Message Summary Server
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
@@ -232,6 +398,7 @@ Restart=always
 RestartSec=5
 User=你的Linux用户名
 Group=你的Linux用户名
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
@@ -266,8 +433,10 @@ journalctl -u qq-message -f
 本机检查后端：
 
 ```bash
-curl http://127.0.0.1:8000/api/health
+curl http://127.0.0.1:8000/api/auth/status
 ```
+
+设置了 `QQ_SUMMARY_WEB_PASSWORD` 后，其他 `/api/*` 接口需要登录 Cookie，直接请求 `/api/health` 可能返回 `401 Login required`。`/api/auth/status` 返回 JSON 即可证明后端已经监听。
 
 ## 8. 配置 Nginx 反向代理
 
@@ -286,6 +455,16 @@ server {
 
     client_max_body_size 20m;
 
+    location = / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8000;
         proxy_http_version 1.1;
@@ -296,6 +475,8 @@ server {
     }
 }
 ```
+
+根页面禁用缓存，避免更新后浏览器继续引用旧的带哈希前端文件；`/assets/` 文件名包含构建哈希，可以继续由浏览器正常缓存。
 
 这里已经使用你的域名 `message.tanlb.xyz`。
 
@@ -393,7 +574,7 @@ https://github.com/NapNeko/NapCat-Installer
 
 ```bash
 sudo apt update
-sudo apt install -y curl screen
+sudo apt install -y curl screen xvfb
 ```
 
 如果你一直用 `root` 部署，可以继续用 `root` 安装 NapCat。此时 NapCat 默认会安装到：
@@ -514,45 +695,68 @@ http://127.0.0.1:6099/webui/?token=日志里显示的token
 
 NapCat 必须一直运行，后端才能持续收到群消息。
 
-最简单的做法是用 `screen` 保持会话：
+优先检查安装器是否已经创建 systemd 服务：
+
+```bash
+systemctl list-unit-files | grep -i napcat
+```
+
+如果存在 `napcat.service`，直接启用开机自启：
+
+```bash
+sudo systemctl enable --now napcat
+sudo systemctl status napcat --no-pager
+journalctl -u napcat -f
+```
+
+如果安装器没有创建服务，并且 NapCat 安装在 `/root/Napcat`，可以创建：
+
+```bash
+sudo nano /etc/systemd/system/napcat.service
+```
+
+写入：
+
+```ini
+[Unit]
+Description=NapCat QQ
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+WorkingDirectory=/root/Napcat/opt/QQ
+ExecStart=/usr/bin/xvfb-run -a /root/Napcat/opt/QQ/qq --no-sandbox --disable-gpu
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+如果使用普通用户安装，把 `User`、`HOME`、`WorkingDirectory` 和 `ExecStart` 改为实际用户名和安装路径。保存后执行：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now napcat
+sudo systemctl status napcat --no-pager
+journalctl -u napcat -f
+```
+
+`screen` 只建议用于首次调试或查看交互式启动过程，不应作为正式的开机自启方案：
 
 ```bash
 screen -S napcat
-```
-
-在 screen 里启动 NapCat。启动成功后按：
-
-```text
-Ctrl+A，然后按 D
-```
-
-这样可以退出 screen，但 NapCat 继续在后台运行。
-
-重新进入：
-
-```bash
+# 在 screen 中运行实际的 NapCat 启动命令
+# Ctrl+A，然后按 D，临时退出会话
 screen -r napcat
-```
-
-查看当前 screen 会话：
-
-```bash
 screen -ls
 ```
 
-如果安装脚本或 TUI-CLI 提供了 systemd 服务管理方式，也可以优先使用它。判断方式是查看是否有 NapCat 相关服务：
-
-```bash
-systemctl list-units --type=service | grep -i napcat
-```
-
-如果看到了服务，例如 `napcat.service`，可以这样管理：
-
-```bash
-sudo systemctl status napcat
-sudo systemctl restart napcat
-journalctl -u napcat -f
-```
+配置完成后必须执行一次 `sudo reboot` 验证 NapCat、QQ 登录和 HTTP Client 都能自动恢复。不要让旧服务器和新服务器上的 NapCat 同时登录同一个 QQ。
 
 #### 8. 安装后的检查
 
@@ -786,6 +990,23 @@ QQ_SUMMARY_WEB_PASSWORD
 
 注意：`.env` 里的 `QQ_SUMMARY_AUTO_SUMMARY_ENABLED=true` 只是全局允许自动总结，具体哪些群能自动总结，还要在网页里手动打开。
 
+### 手动总结、进度和断点恢复
+
+当前手动总结支持填写 `1-5000` 条，留空默认按上限 5000 条处理。手动总结从最早的未读消息开始，自动总结仍固定每批最多 500 条。
+
+手动总结使用后台任务：
+
+```text
+1. 网页创建任务后立即返回，不会持续占用一个 Nginx 请求。
+2. 后台按分块并行调用 DeepSeek，网页显示已完成块数和百分比。
+3. 刷新或关闭网页不会中断任务，重新进入该群会恢复进度显示。
+4. 每个已完成分块都会写入 SQLite 检查点。
+5. qq-message 服务重启后，未完成任务会自动重新入队，只补做未完成分块。
+6. 最终总结、已读游标和任务完成状态在同一个 SQLite 事务中提交。
+```
+
+不要在任务运行时删除本批消息对应的历史记录。迁移、更新或重启前优先等待任务完成；无法等待时，必须完整备份并迁移 `qq_summary.sqlite3`，才能保留任务快照和检查点。
+
 ## 12. 部署后的检查清单
 
 检查后端服务：
@@ -797,7 +1018,7 @@ sudo systemctl status qq-message
 检查后端接口：
 
 ```bash
-curl http://127.0.0.1:8000/api/health
+curl http://127.0.0.1:8000/api/auth/status
 ```
 
 检查 Nginx：
@@ -833,21 +1054,40 @@ journalctl -u qq-message -f
 
 ## 13. 更新代码流程
 
-以后本地修改代码并推送到 GitHub 后，服务器这样更新。
+以后本地修改代码并推送到 GitHub 后，按下面流程更新。不要在本地修改尚未推送时直接操作服务器，否则 `git pull` 无法获得新代码。
 
-进入项目目录：
+进入项目目录并检查工作区：
 
 ```bash
 cd /opt/qq_message
+git status --short
+git log -1 --oneline
 ```
 
-拉取最新代码：
+如果 `git status --short` 有输出，先确认这些服务器本地修改的来源，不要直接执行 `git reset --hard`。
+
+记录当前提交并在线备份 SQLite：
 
 ```bash
-git pull
+git rev-parse HEAD | tee /tmp/qq-message-old-commit
+
+mkdir -p /opt/qq_message/backups
+BACKUP="/opt/qq_message/backups/qq_summary_$(date +%F_%H-%M-%S).sqlite3"
+sqlite3 /opt/qq_message/data/qq_summary.sqlite3 ".backup '$BACKUP'"
+sha256sum "$BACKUP"
+ls -lh "$BACKUP"
 ```
 
-如果前端代码有变化：
+`.backup` 会生成一致的 SQLite 快照，不需要为了备份停止正在运行的后端。正在执行的手动总结任务及其分块检查点也会被保存。
+
+拉取指定远程分支：
+
+```bash
+git pull --ff-only origin main
+git log -1 --oneline
+```
+
+构建前端：
 
 ```bash
 cd /opt/qq_message/frontend
@@ -855,25 +1095,60 @@ npm ci
 npm run build
 ```
 
-重启后端：
-
-```bash
-sudo systemctl restart qq-message
-```
-
-确认状态：
-
-```bash
-sudo systemctl status qq-message
-```
-
-如果只是改了后端 Python 代码，可以省略 `npm ci` 和 `npm run build`：
+运行后端测试：
 
 ```bash
 cd /opt/qq_message
-git pull
+source .venv/bin/activate
+python -m unittest discover -s tests
+```
+
+测试通过后重启后端。正在执行的手动总结任务会从 SQLite 检查点重新入队，已经完成的分块不会重复请求：
+
+```bash
 sudo systemctl restart qq-message
 ```
+
+确认状态和启动日志：
+
+```bash
+sudo systemctl status qq-message --no-pager
+sudo journalctl -u qq-message -n 200 --no-pager
+```
+
+数据库较大时，启动阶段的历史 CQ 消息修复可能需要一段时间。必须在日志中看到下面内容后，才算后端已经开始监听：
+
+```text
+QQ Message Summary running at http://127.0.0.1:8000
+```
+
+检查前端构建文件是否已经在线：
+
+```bash
+LOCAL_ASSET=$(grep -o 'assets/index-[^" ]*\.js' /opt/qq_message/frontend/dist/index.html | head -n 1)
+REMOTE_ASSET=$(curl -s https://message.tanlb.xyz/ | grep -o 'assets/index-[^" ]*\.js' | head -n 1)
+echo "local:  $LOCAL_ASSET"
+echo "remote: $REMOTE_ASSET"
+```
+
+两边文件名应当一致。浏览器仍显示旧页面时使用 `Ctrl+F5` 强制刷新。
+
+更新后出现问题时回退：
+
+```bash
+cd /opt/qq_message
+OLD_COMMIT=$(cat /tmp/qq-message-old-commit)
+git switch --detach "$OLD_COMMIT"
+
+cd frontend
+npm ci
+npm run build
+
+sudo systemctl restart qq-message
+sudo systemctl status qq-message --no-pager
+```
+
+回退代码前不要直接覆盖当前数据库。新代码已经写入的新表通常会被旧代码忽略；只有确认数据库迁移导致问题时，才停止 NapCat 和后端，再恢复更新前的数据库备份。
 
 ## 14. 备份数据库
 
@@ -883,11 +1158,17 @@ SQLite 数据库默认在：
 /opt/qq_message/data/qq_summary.sqlite3
 ```
 
-手动备份：
+使用 SQLite 在线备份接口，不要在后端持续写入时直接 `cp` 数据库文件：
 
 ```bash
 mkdir -p /opt/qq_message/backups
-cp /opt/qq_message/data/qq_summary.sqlite3 "/opt/qq_message/backups/qq_summary_$(date +%F_%H-%M-%S).sqlite3"
+
+BACKUP="/opt/qq_message/backups/qq_summary_$(date +%F_%H-%M-%S).sqlite3"
+sqlite3 /opt/qq_message/data/qq_summary.sqlite3 ".backup '$BACKUP'"
+chmod 600 "$BACKUP"
+
+sqlite3 "$BACKUP" "PRAGMA quick_check;"
+sha256sum "$BACKUP"
 ```
 
 查看备份：
@@ -896,7 +1177,7 @@ cp /opt/qq_message/data/qq_summary.sqlite3 "/opt/qq_message/backups/qq_summary_$
 ls -lh /opt/qq_message/backups
 ```
 
-建议后续加定时备份，例如每天凌晨备份一次，并定期删除很老的备份。
+`PRAGMA quick_check` 应输出 `ok`。建议后续加定时备份，例如每天凌晨备份一次，并定期删除很老的备份。备份文件包含聊天内容、总结和任务检查点，不能放到公开下载目录。
 
 ## 15. 数据增长和清理建议
 
@@ -1025,7 +1306,7 @@ python -c "from app.config import load_settings; s=load_settings(); print(bool(s
 
 ```bash
 sudo systemctl status qq-message
-curl http://127.0.0.1:8000/api/health
+curl http://127.0.0.1:8000/api/auth/status
 ```
 
 如果后端没有启动，查看日志：
@@ -1033,6 +1314,40 @@ curl http://127.0.0.1:8000/api/health
 ```bash
 journalctl -u qq-message -n 200 --no-pager
 ```
+
+### 点击总结出现 504 或 `Unexpected token '<'`
+
+当前手动总结接口只创建后台任务，应当快速返回 HTTP `202`。如果 `/api/groups/.../summarize` 仍然等待很久并返回 `504 Gateway Timeout`，通常说明线上仍在运行旧版同步后端。
+
+如果页面显示：
+
+```text
+Unexpected token '<', "<!DOCTYPE "... is not valid JSON
+```
+
+说明浏览器使用的也是旧前端。新版前端会把非 JSON 响应显示为明确的 HTTP 错误，不会直接抛出 JSON 解析异常。
+
+在服务器检查源码和进程启动时间：
+
+```bash
+cd /opt/qq_message
+git log -1 --oneline
+grep -n "MANUAL_SUMMARY_QUEUE" app/server.py
+grep -n "getSummaryTask" frontend/src/services/api.js
+
+sudo systemctl show qq-message -p MainPID -p ExecMainStartTimestamp -p ActiveState
+sudo journalctl -u qq-message -n 200 --no-pager
+sudo tail -n 100 /var/log/nginx/error.log
+```
+
+对比线上和本机构建文件：
+
+```bash
+grep -o 'assets/index-[^" ]*\.js' /opt/qq_message/frontend/dist/index.html
+curl -s https://message.tanlb.xyz/ | grep -o 'assets/index-[^" ]*\.js'
+```
+
+如果不一致，重新执行第 13 节的 `npm ci`、`npm run build` 和 `systemctl restart qq-message`，然后用 `Ctrl+F5` 刷新浏览器。
 
 ### 前端页面不是最新的
 

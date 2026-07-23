@@ -6,7 +6,7 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Callable
 
@@ -19,7 +19,21 @@ CHUNK_MAX_CHARS = 12000
 MERGE_MAX_BLOCKS = 12
 MERGE_MAX_CHARS = 18000
 CHUNK_PARALLELISM = 4
-SPECIAL_MEMBER_NAME = "魔女公主♪"
+SUMMARY_PIPELINE_VERSION = 2
+DEFAULT_SPECIAL_MEMBER_NAME = "魔女公主♪"
+SUMMARY_SECTIONS = ("topics", "actions", "attention", "special_member")
+EVIDENCE_TYPES = {
+    "confirmed_fact",
+    "confirmed_plan",
+    "proposal",
+    "banter",
+    "self_report",
+    "reported_concern",
+    "disagreement",
+    "unknown",
+}
+NAMED_QQ_MENTION_PATTERN = re.compile(r"@([^()\s]{1,60})\((\d{5,12})\)")
+QQ_MENTION_PATTERN = re.compile(r"@(\d{5,12})\b")
 
 
 class SummarizerError(RuntimeError):
@@ -51,7 +65,61 @@ def _message_time_range(messages: list[Message]) -> str:
 def _format_message_line(message: Message) -> str:
     content = message.content.replace("\r\n", "\n").replace("\r", "\n").strip()
     content = " / ".join(line.strip() for line in content.splitlines() if line.strip())
-    return f"[{_format_time(message.timestamp)}][{message.sender_name}] {content}"
+    position = f"#{message.position}" if message.position else "#?"
+    alias = message.sender_alias or "成员"
+    relations = []
+    if message.is_special_sender:
+        relations.append("重点成员本人")
+    if message.mentions_special:
+        relations.append("@重点成员")
+    if message.replies_to_special:
+        relations.append("回复重点成员")
+    relation_text = f"[{'/'.join(relations)}]" if relations else ""
+    return (
+        f"[{position}][{_format_time(message.timestamp)}]"
+        f"[{alias}][当前昵称：{message.sender_name}]{relation_text} {content}"
+    )
+
+
+def prepare_messages(messages: list[Message], special_user_id: str | None) -> list[Message]:
+    aliases: dict[str, str] = {}
+    for message in messages:
+        if special_user_id and message.user_id == special_user_id:
+            continue
+        aliases.setdefault(message.user_id, f"成员{len(aliases) + 1:03d}")
+
+    def mention_alias(user_id: str) -> str:
+        if special_user_id and user_id == special_user_id:
+            return "重点成员"
+        return aliases.get(user_id, "某成员")
+
+    prepared = []
+    for index, message in enumerate(messages, start=1):
+        if special_user_id and message.user_id == special_user_id:
+            alias = "重点成员"
+        else:
+            alias = aliases[message.user_id]
+        content = NAMED_QQ_MENTION_PATTERN.sub(
+            lambda match: f"@{mention_alias(match.group(2))}（{match.group(1)}）",
+            message.content,
+        )
+        content = QQ_MENTION_PATTERN.sub(
+            lambda match: f"@{mention_alias(match.group(1))}",
+            content,
+        )
+        prepared.append(
+            replace(
+                message,
+                content=content,
+                position=message.position or index,
+                sender_alias=alias,
+                is_special_sender=bool(
+                    message.is_special_sender
+                    or (special_user_id and message.user_id == special_user_id)
+                ),
+            )
+        )
+    return prepared
 
 
 def _formatted_messages_chars(messages: list[Message]) -> int:
@@ -133,37 +201,16 @@ def build_summary_prompt(
     group_name: str,
     messages: list[Message],
     max_chars: int = SINGLE_CALL_MAX_CHARS,
+    special_member_name: str = DEFAULT_SPECIAL_MEMBER_NAME,
 ) -> list[dict[str, str]]:
-    message_text = compact_messages(messages, max_chars=max_chars)
-    system = (
-        "你是一个谨慎的 QQ 群消息总结助手。"
-        "你只根据用户提供的聊天记录总结，不编造不存在的信息。"
-        "请以覆盖信息为优先，不要为了简短漏掉具体话题、问题、情绪变化或零散但可能有用的消息。"
-        "相似寒暄和重复刷屏可以合并，其他独立信息点尽量保留，清晰中文输出。"
+    return build_chunk_summary_prompt(
+        group_name,
+        messages,
+        chunk_index=1,
+        total_chunks=1,
+        max_chars=max_chars,
+        special_member_name=special_member_name,
     )
-    user = f"""
-请总结 QQ 群「{group_name}」中以下 {len(messages)} 条新消息。
-输出格式：
-## 总览
-用 4-8 句话说明这批消息主要在聊什么，要覆盖所有主要话题、明显情绪/争议、重要进展和可能需要用户知道的小变化。
-## 重点话题
-- 按话题尽量完整列出，不要只列最热门的话题；每个话题说明参与者、主要内容、结论/分歧/状态。
-- 只有一两条消息但包含新信息、问题、邀请、安排、链接、文件、提醒或明显情绪的，也要列出。
-- 如果内容很零散，可以增加“零散但可能有用的信息”小项集中列出。
-## 待办/决定
-- 列出明确的待办、负责人、时间点；没有就写“暂无明确待办”。
-## 需要关注
-- 列出 @我、重要链接、文件、风险、争议或可能需要回复的内容；没有就写“暂无特别需要关注”。
-## {SPECIAL_MEMBER_NAME} 专属
-- 单独总结和“{SPECIAL_MEMBER_NAME}”相关的内容：她本人发的消息、别人回复她的消息、@她/提到她的消息、围绕她的安排/问题/争议/需要回复事项。
-- 需要尽量保留具体上下文、被回复内容、相关人员和可能需要她注意的点；没有相关内容就写“暂无和 {SPECIAL_MEMBER_NAME} 直接相关的内容”。
-## 消息范围
-- 简短说明消息数量和时间范围：{_message_time_range(messages)}。
-
-聊天记录：
-{message_text}
-""".strip()
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
 def build_chunk_summary_prompt(
@@ -172,24 +219,47 @@ def build_chunk_summary_prompt(
     chunk_index: int,
     total_chunks: int,
     max_chars: int = CHUNK_MAX_CHARS,
+    special_member_name: str = DEFAULT_SPECIAL_MEMBER_NAME,
 ) -> list[dict[str, str]]:
     message_text = compact_messages(messages, max_chars=max_chars)
     system = (
-        "你是一个 QQ 群消息分块总结助手。"
-        "当前任务只总结提供给你的这一块聊天记录，不要推测其他分块的内容。"
-        "当前分块摘要会作为最终总结的唯一依据，所以要优先保留细节覆盖率。"
-        "保留关键人物、独立话题、低频但具体的信息、决定、待办、风险、链接/文件线索和需要回复的事项。"
+        "你是谨慎的 QQ 群消息事实提取助手。"
+        "只能依据提供的聊天记录，不得补充常识推断、诊断、动机或现实身份。"
+        "每个条目必须引用本块中真实存在的消息位置。"
     )
     user = f"""
 请总结 QQ 群「{group_name}」的第 {chunk_index}/{total_chunks} 块消息。
 本块共 {len(messages)} 条，时间范围：{_message_time_range(messages)}。
 
-输出要求：
-- 用清晰中文输出，可以适当详细，避免漏掉独立信息点。
-- 按“本块概览 / 重点话题 / 零散但可能有用的信息 / 待办或决定 / 需要关注 / {SPECIAL_MEMBER_NAME} 专属 / 时间范围”组织。
-- “重点话题”尽量覆盖本块内出现过的不同话题；重复表情、玩笑和刷屏可合并，但不要删除有新含义的消息。
-- “{SPECIAL_MEMBER_NAME} 专属”要单独保留她本人发言、别人回复她、@她/提到她、围绕她的安排/问题/争议/需要回复事项；没有就写“暂无”。
-- 不要输出最终总结，只输出本块摘要，方便之后合并。
+只输出一个 JSON 对象，不要使用 Markdown 代码块。固定结构：
+{{
+  "topics": [条目],
+  "actions": [条目],
+  "attention": [条目],
+  "special_member": [条目]
+}}
+每个条目固定结构：
+{{
+  "title": "简短标题",
+  "type": "证据类型",
+  "status": "明确状态，没有则为空字符串",
+  "summary": "严格依据原消息的中文归纳",
+  "participants": ["成员别名"],
+  "evidence": [消息位置数字]
+}}
+
+证据类型只能使用：confirmed_fact、confirmed_plan、proposal、banter、self_report、reported_concern、disagreement、unknown。
+规则：
+- 明确发生的事实用 confirmed_fact；明确承诺或安排才用 confirmed_plan；建议和意向用 proposal。
+- 玩笑、跟风、角色扮演、暧昧话术用 banter，绝不能改写成真实计划或风险。
+- 成员对账号、金额、经历和健康的自述用 self_report，不得写成已核实事实。
+- 别人表达担忧用 reported_concern，不得升级为客观健康风险或诊断。
+- 不得把“没人回应”“尚未解决”“存在风险”作为结论，除非消息明确说明。
+- 昵称可能是角色扮演，不得映射到现实同名人物；不得改变原词含义，例如“黄油”不能写成“黄图”。
+- actions 只放 confirmed_plan 或 proposal；attention 只放确实需要回复、明确争议或明确担忧的内容。
+- special_member 只允许引用带“重点成员本人”“@重点成员”或“回复重点成员”标记的消息。
+- “{special_member_name}”只是显示名称，重点成员身份只由上述标记确定。相似昵称、带“伪”的昵称都不是身份依据。
+- 合并重复刷屏，但尽量覆盖有实际信息的独立话题。每个条目保留 1-5 个最直接的证据位置。
 
 聊天记录：
 {message_text}
@@ -212,9 +282,7 @@ def _summary_blocks_text(blocks: list[SummaryBlock], max_chars: int | None = Non
             )
         )
     text = "\n\n".join(parts)
-    if max_chars is None:
-        return text
-    return compact_text(text, max_chars=max_chars, marker="\n\n...中间分块总结省略...\n\n")
+    return text
 
 
 def build_merge_summary_prompt(
@@ -224,42 +292,24 @@ def build_merge_summary_prompt(
     total_chunk_count: int,
     final: bool,
     max_chars: int = MERGE_MAX_CHARS,
+    special_member_name: str = DEFAULT_SPECIAL_MEMBER_NAME,
 ) -> list[dict[str, str]]:
-    block_text = _summary_blocks_text(blocks, max_chars=max_chars)
+    block_text = _summary_blocks_text(blocks)
     system = (
-        "你是一个 QQ 群消息总结合并助手。"
-        "你只根据分块摘要合并信息，不编造不存在的信息。"
-        "合并时要去重，把重复话题归并到一起，但不要因为追求简短而丢弃低频但具体的信息。"
-        "尤其要保留待办、决定、问题、邀请、安排、风险、链接/文件线索、需要回复的事项和明显情绪变化。"
+        "你是 QQ 群结构化事实合并助手。"
+        "只能合并输入 JSON 中已有的信息，所有结论必须继续保留原始消息位置。"
+        "不得提升证据强度，不得把玩笑变成计划、把自述变成事实、把担忧变成客观风险。"
     )
-    if final:
-        task = "请把以下分块摘要合并为最终总结。"
-        output = f"""
-输出格式：
-## 总览
-用 4-8 句话说明整体主要在聊什么，覆盖主要话题、次要但具体的话题、重要情绪/争议和关键进展。
-## 重点话题
-- 按话题合并列出，尽量覆盖所有独立信息点，不只列最热门的话题。
-- 每个话题说明参与者、主要内容、结论/分歧/状态；如果只是闲聊，也简要说明聊了什么和是否有需要关注的点。
-- 对零散但可能有用的信息，单独列“零散但可能有用的信息”。
-## 待办/决定
-- 合并明确的待办、负责人、时间点；没有就写“暂无明确待办”。
-## 需要关注
-- 合并 @我、重要链接、文件、风险、争议或可能需要回复的内容；没有就写“暂无特别需要关注”。
-## {SPECIAL_MEMBER_NAME} 专属
-- 合并所有分块里和“{SPECIAL_MEMBER_NAME}”相关的内容：她本人发言、别人回复她、@她/提到她、围绕她的安排/问题/争议/需要回复事项。
-- 尽量保留具体上下文、被回复内容、相关人员、结论/状态和可能需要她注意或回复的点；没有相关内容就写“暂无和 {SPECIAL_MEMBER_NAME} 直接相关的内容”。
-## 消息范围
-- 说明本次共 {total_message_count} 条消息，采用 {total_chunk_count} 个分块处理，并概括时间范围。
-""".strip()
-    else:
-        task = "请把以下较小的分块摘要先合并成一个中间摘要，供最终总结继续合并。"
-        output = f"""
-输出要求：
-- 保持简洁中文。
-- 保留所有独立话题、明确待办、决定、问题、安排、风险、链接/文件线索和需要回复的事项。
-- 保留所有和“{SPECIAL_MEMBER_NAME}”相关的信息，后续最终总结需要单独生成“{SPECIAL_MEMBER_NAME} 专属”小节。
-- 合并重复话题，但不要丢弃相互冲突的观点。
+    task = "请合并为最终结构" if final else "请合并为中间结构"
+    output = f"""
+只输出 JSON，不要输出 Markdown。输出结构与输入完全相同：topics、actions、attention、special_member 四个数组。
+- 合并同一事件并合并 evidence，冲突观点必须保留，证据位置必须是输入中已有的数字。
+- type 只能是：{', '.join(sorted(EVIDENCE_TYPES))}。
+- confirmed_plan、proposal、banter、self_report、reported_concern、disagreement 不能在合并时升级为 confirmed_fact。
+- actions 只放 confirmed_plan 或 proposal。
+- special_member 只能保留原来已在 special_member 中的条目，不得根据昵称重新识别。
+- “{special_member_name}”仅为显示名称，不代表昵称相似者。
+- 每个条目保留 1-8 个最直接的证据位置；不要生成消息中不存在的状态。
 """.strip()
 
     user = f"""
@@ -304,6 +354,202 @@ def split_summary_blocks(
     return batches
 
 
+def parse_summary_json(
+    value: str,
+    allowed_positions: set[int],
+    special_positions: set[int],
+) -> dict[str, list[dict[str, Any]]]:
+    text = value.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SummarizerError("DeepSeek did not return valid summary JSON") from exc
+    if not isinstance(payload, dict):
+        raise SummarizerError("DeepSeek summary JSON must be an object")
+
+    normalized: dict[str, list[dict[str, Any]]] = {}
+    for section in SUMMARY_SECTIONS:
+        raw_items = payload.get(section, [])
+        if not isinstance(raw_items, list):
+            raise SummarizerError(f"Summary section {section} must be an array")
+        items = []
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                raise SummarizerError(f"Summary section {section} contains a non-object item")
+            item_type = str(raw_item.get("type") or "unknown").strip()
+            if item_type not in EVIDENCE_TYPES:
+                raise SummarizerError(f"Unsupported evidence type: {item_type}")
+            if section == "actions" and item_type not in {"confirmed_plan", "proposal"}:
+                raise SummarizerError("Actions may only contain confirmed_plan or proposal items")
+            evidence_raw = raw_item.get("evidence")
+            if not isinstance(evidence_raw, list) or not evidence_raw:
+                raise SummarizerError("Every summary item must contain evidence positions")
+            try:
+                evidence = list(dict.fromkeys(int(position) for position in evidence_raw))
+            except (TypeError, ValueError) as exc:
+                raise SummarizerError("Evidence positions must be integers") from exc
+            if any(position not in allowed_positions for position in evidence):
+                raise SummarizerError("Summary referenced a message outside the provided input")
+            if section == "special_member" and not special_positions.intersection(evidence):
+                raise SummarizerError("Special member item has no QQ-verified evidence")
+
+            title = str(raw_item.get("title") or "").strip()
+            summary = str(raw_item.get("summary") or "").strip()
+            if not title or not summary:
+                raise SummarizerError("Every summary item needs a title and summary")
+            participants_raw = raw_item.get("participants") or []
+            participants = (
+                [str(participant).strip() for participant in participants_raw if str(participant).strip()]
+                if isinstance(participants_raw, list)
+                else []
+            )
+            items.append(
+                {
+                    "title": title,
+                    "type": item_type,
+                    "status": str(raw_item.get("status") or "").strip(),
+                    "summary": summary,
+                    "participants": list(dict.fromkeys(participants))[:12],
+                    "evidence": evidence[:8],
+                }
+            )
+        normalized[section] = items
+    return normalized
+
+
+def summary_json_text(payload: dict[str, list[dict[str, Any]]]) -> str:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _evidence_label(item: dict[str, Any], messages_by_position: dict[int, Message]) -> str:
+    labels = []
+    for position in item["evidence"]:
+        message = messages_by_position.get(int(position))
+        if message is None:
+            continue
+        labels.append(f"#{position} {_format_time(message.timestamp)}")
+    return "、".join(labels)
+
+
+def _render_items(
+    items: list[dict[str, Any]],
+    messages_by_position: dict[int, Message],
+    participant_names: dict[str, str],
+    empty_text: str,
+) -> list[str]:
+    if not items:
+        return [empty_text]
+    lines = []
+    type_labels = {
+        "confirmed_fact": "已确认事实",
+        "confirmed_plan": "明确安排",
+        "proposal": "提议/意向",
+        "banter": "玩笑互动",
+        "self_report": "成员自述",
+        "reported_concern": "群友担忧",
+        "disagreement": "存在分歧",
+        "unknown": "信息不足",
+    }
+    for item in items:
+        details = [type_labels[item["type"]]]
+        if item["status"]:
+            details.append(item["status"])
+        participants = "、".join(
+            (
+                f"{participant}（{participant_names[participant]}）"
+                if participant in participant_names
+                else participant
+            )
+            for participant in item["participants"]
+        )
+        if participants:
+            details.append(f"参与者：{participants}")
+        evidence = _evidence_label(item, messages_by_position)
+        lines.append(
+            f"**{item['title']}**（{'；'.join(details)}）：{item['summary']}"
+            + (f" [证据：{evidence}]" if evidence else "")
+        )
+    return lines
+
+
+def render_summary(
+    payload: dict[str, list[dict[str, Any]]],
+    summary_messages: list[Message],
+    source_messages: list[Message],
+    total_chunk_count: int,
+    special_member_name: str,
+) -> str:
+    messages_by_position = {message.position: message for message in summary_messages}
+    participant_names = {
+        message.sender_alias: message.sender_name
+        for message in summary_messages
+        if message.sender_alias
+    }
+    topic_items = payload["topics"]
+    overview = [item["summary"] for item in topic_items[:6]]
+    lines = ["## 总览"]
+    lines.extend(f"- {item}" for item in overview or ["本批消息没有可确认的文本话题。"])
+    lines.extend(["", "## 重点话题"])
+    lines.extend(
+        _render_items(
+            topic_items,
+            messages_by_position,
+            participant_names,
+            "暂无明确重点话题。",
+        )
+    )
+    lines.extend(["", "## 待办/决定"])
+    lines.extend(
+        _render_items(
+            payload["actions"],
+            messages_by_position,
+            participant_names,
+            "暂无明确待办。",
+        )
+    )
+    lines.extend(["", "## 需要关注"])
+    lines.extend(
+        _render_items(
+            payload["attention"],
+            messages_by_position,
+            participant_names,
+            "暂无特别需要关注。",
+        )
+    )
+    lines.extend(["", f"## {special_member_name} 专属"])
+    lines.extend(
+        _render_items(
+            payload["special_member"],
+            messages_by_position,
+            participant_names,
+            f"暂无与 {special_member_name} QQ 身份直接关联的内容。",
+        )
+    )
+
+    range_messages = source_messages or summary_messages
+    time_range = _message_time_range(range_messages)
+    max_gap_seconds = 0
+    if len(range_messages) > 1:
+        max_gap_seconds = max(
+            max(current.timestamp - previous.timestamp, 0)
+            for previous, current in zip(range_messages, range_messages[1:])
+        )
+    gap_minutes, gap_seconds = divmod(max_gap_seconds, 60)
+    lines.extend(
+        [
+            "",
+            "## 消息范围",
+            f"- 原始消息 {len(source_messages)} 条，其中有效文本消息 {len(summary_messages)} 条。",
+            f"- 使用 {total_chunk_count} 个分块，时间范围：{time_range}。",
+            f"- 相邻消息最长间隔：{gap_minutes} 分 {gap_seconds} 秒（由程序计算）。",
+        ]
+    )
+    return "\n".join(lines).strip()
+
+
 class DeepSeekClient:
     def __init__(
         self,
@@ -317,6 +563,8 @@ class DeepSeekClient:
         merge_max_blocks: int = MERGE_MAX_BLOCKS,
         merge_max_chars: int = MERGE_MAX_CHARS,
         chunk_parallelism: int = CHUNK_PARALLELISM,
+        special_member_user_id: str | None = None,
+        special_member_display_name: str = DEFAULT_SPECIAL_MEMBER_NAME,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -328,6 +576,8 @@ class DeepSeekClient:
         self.merge_max_blocks = merge_max_blocks
         self.merge_max_chars = merge_max_chars
         self.chunk_parallelism = max(int(chunk_parallelism), 1)
+        self.special_member_user_id = special_member_user_id
+        self.special_member_display_name = special_member_display_name
 
     def summarize(
         self,
@@ -337,12 +587,15 @@ class DeepSeekClient:
         plan_callback: Callable[[int], None] | None = None,
         chunk_callback: Callable[[int, SummaryBlock], None] | None = None,
         stage_callback: Callable[[str], None] | None = None,
+        source_messages: list[Message] | None = None,
     ) -> str:
         if not self.api_key:
             raise SummarizerError("Missing DEEPSEEK_API_KEY environment variable")
         if not messages:
             raise SummarizerError("No messages to summarize")
 
+        messages = prepare_messages(messages, self.special_member_user_id)
+        source_messages = source_messages or messages
         saved_blocks = existing_blocks or {}
         can_use_single_call = (
             len(messages) <= self.chunk_max_messages
@@ -353,23 +606,42 @@ class DeepSeekClient:
                 plan_callback(1)
             saved = saved_blocks.get(1)
             if saved is not None:
-                return saved.content
-            summary = self._chat(
+                payload = parse_summary_json(
+                    saved.content,
+                    {message.position for message in messages},
+                    self._special_positions(messages),
+                )
+                return render_summary(
+                    payload,
+                    messages,
+                    source_messages,
+                    1,
+                    self.special_member_display_name,
+                )
+            payload = self._chat_structured(
                 build_summary_prompt(
                     group_name,
                     messages,
                     max_chars=self.single_call_max_chars,
-                )
+                    special_member_name=self.special_member_display_name,
+                ),
+                messages,
             )
             block = SummaryBlock(
                 title="完整摘要",
                 message_count=len(messages),
                 time_range=_message_time_range(messages),
-                content=summary,
+                content=summary_json_text(payload),
             )
             if chunk_callback:
                 chunk_callback(1, block)
-            return summary
+            return render_summary(
+                payload,
+                messages,
+                source_messages,
+                1,
+                self.special_member_display_name,
+            )
 
         chunks = split_messages(
             messages,
@@ -381,43 +653,64 @@ class DeepSeekClient:
                 plan_callback(1)
             saved = saved_blocks.get(1)
             if saved is not None:
-                return saved.content
-            summary = self._chat(
+                payload = parse_summary_json(
+                    saved.content,
+                    {message.position for message in chunks[0]},
+                    self._special_positions(chunks[0]),
+                )
+                return render_summary(
+                    payload,
+                    messages,
+                    source_messages,
+                    1,
+                    self.special_member_display_name,
+                )
+            payload = self._chat_structured(
                 build_summary_prompt(
                     group_name,
                     chunks[0],
                     max_chars=max(self.single_call_max_chars, self.chunk_max_chars),
-                )
+                    special_member_name=self.special_member_display_name,
+                ),
+                chunks[0],
             )
             block = SummaryBlock(
                 title="完整摘要",
                 message_count=len(chunks[0]),
                 time_range=_message_time_range(chunks[0]),
-                content=summary,
+                content=summary_json_text(payload),
             )
             if chunk_callback:
                 chunk_callback(1, block)
-            return summary
+            return render_summary(
+                payload,
+                messages,
+                source_messages,
+                1,
+                self.special_member_display_name,
+            )
 
         if plan_callback:
             plan_callback(len(chunks))
 
         def summarize_chunk(item: tuple[int, list[Message]]) -> SummaryBlock:
             index, chunk = item
-            chunk_summary = self._chat(
+            chunk_payload = self._chat_structured(
                 build_chunk_summary_prompt(
                     group_name,
                     chunk,
                     chunk_index=index,
                     total_chunks=len(chunks),
                     max_chars=self.chunk_max_chars,
-                )
+                    special_member_name=self.special_member_display_name,
+                ),
+                chunk,
             )
             block = SummaryBlock(
                 title=f"第 {index}/{len(chunks)} 块",
                 message_count=len(chunk),
                 time_range=_message_time_range(chunk),
-                content=chunk_summary,
+                content=summary_json_text(chunk_payload),
             )
             if chunk_callback:
                 chunk_callback(index, block)
@@ -441,11 +734,19 @@ class DeepSeekClient:
         if stage_callback:
             stage_callback("merging")
 
-        return self._merge_summary_blocks(
+        payload = self._merge_summary_blocks(
             group_name=group_name,
             blocks=blocks,
             total_message_count=len(messages),
             total_chunk_count=len(chunks),
+            messages=messages,
+        )
+        return render_summary(
+            payload,
+            messages,
+            source_messages,
+            len(chunks),
+            self.special_member_display_name,
         )
 
     def _merge_summary_blocks(
@@ -454,9 +755,10 @@ class DeepSeekClient:
         blocks: list[SummaryBlock],
         total_message_count: int,
         total_chunk_count: int,
-    ) -> str:
+        messages: list[Message],
+    ) -> dict[str, list[dict[str, Any]]]:
         if len(blocks) <= self.merge_max_blocks and len(_summary_blocks_text(blocks)) <= self.merge_max_chars:
-            return self._chat(
+            return self._chat_structured(
                 build_merge_summary_prompt(
                     group_name=group_name,
                     blocks=blocks,
@@ -464,7 +766,10 @@ class DeepSeekClient:
                     total_chunk_count=total_chunk_count,
                     final=True,
                     max_chars=self.merge_max_chars,
-                )
+                    special_member_name=self.special_member_display_name,
+                ),
+                messages,
+                source_blocks=blocks,
             )
 
         batches = split_summary_blocks(
@@ -472,8 +777,8 @@ class DeepSeekClient:
             max_blocks=self.merge_max_blocks,
             max_chars=self.merge_max_chars,
         )
-        if len(batches) == 1:
-            return self._chat(
+        if len(batches) == 1 or len(batches) == len(blocks):
+            return self._chat_structured(
                 build_merge_summary_prompt(
                     group_name=group_name,
                     blocks=blocks,
@@ -481,12 +786,21 @@ class DeepSeekClient:
                     total_chunk_count=total_chunk_count,
                     final=True,
                     max_chars=self.merge_max_chars,
-                )
+                    special_member_name=self.special_member_display_name,
+                ),
+                messages,
+                source_blocks=blocks,
             )
 
         reduced_blocks: list[SummaryBlock] = []
         for index, batch in enumerate(batches, start=1):
-            merged = self._chat(
+            batch_positions = {
+                position
+                for block in batch
+                for position in self._block_positions(block)
+            }
+            batch_messages = [message for message in messages if message.position in batch_positions]
+            merged = self._chat_structured(
                 build_merge_summary_prompt(
                     group_name=group_name,
                     blocks=batch,
@@ -494,14 +808,17 @@ class DeepSeekClient:
                     total_chunk_count=total_chunk_count,
                     final=False,
                     max_chars=self.merge_max_chars,
-                )
+                    special_member_name=self.special_member_display_name,
+                ),
+                batch_messages,
+                source_blocks=batch,
             )
             reduced_blocks.append(
                 SummaryBlock(
                     title=f"合并块 {index}/{len(batches)}",
                     message_count=sum(block.message_count for block in batch),
                     time_range=f"{batch[0].time_range}；{batch[-1].time_range}",
-                    content=merged,
+                    content=summary_json_text(merged),
                 )
             )
 
@@ -510,7 +827,98 @@ class DeepSeekClient:
             blocks=reduced_blocks,
             total_message_count=total_message_count,
             total_chunk_count=total_chunk_count,
+            messages=messages,
         )
+
+    @staticmethod
+    def _special_positions(messages: list[Message]) -> set[int]:
+        return {
+            message.position
+            for message in messages
+            if message.is_special_sender or message.mentions_special or message.replies_to_special
+        }
+
+    @staticmethod
+    def _block_positions(block: SummaryBlock) -> set[int]:
+        try:
+            payload = json.loads(block.content)
+        except json.JSONDecodeError:
+            return set()
+        return {
+            int(position)
+            for section in SUMMARY_SECTIONS
+            for item in payload.get(section, [])
+            if isinstance(item, dict)
+            for position in item.get("evidence", [])
+        }
+
+    @staticmethod
+    def _block_evidence_metadata(
+        blocks: list[SummaryBlock],
+    ) -> tuple[dict[int, set[str]], set[int]]:
+        types_by_position: dict[int, set[str]] = {}
+        special_positions: set[int] = set()
+        for block in blocks:
+            try:
+                payload = json.loads(block.content)
+            except json.JSONDecodeError:
+                continue
+            for section in SUMMARY_SECTIONS:
+                for item in payload.get(section, []):
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = str(item.get("type") or "unknown")
+                    for raw_position in item.get("evidence", []):
+                        position = int(raw_position)
+                        types_by_position.setdefault(position, set()).add(item_type)
+                        if section == "special_member":
+                            special_positions.add(position)
+        return types_by_position, special_positions
+
+    def _chat_structured(
+        self,
+        messages: list[dict[str, str]],
+        source_messages: list[Message],
+        source_blocks: list[SummaryBlock] | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        allowed_positions = {message.position for message in source_messages}
+        special_positions = self._special_positions(source_messages)
+        source_types: dict[int, set[str]] = {}
+        if source_blocks is not None:
+            source_types, special_positions = self._block_evidence_metadata(source_blocks)
+        last_error: SummarizerError | None = None
+        prompt = list(messages)
+        for attempt in range(2):
+            raw = self._chat(prompt)
+            try:
+                payload = parse_summary_json(raw, allowed_positions, special_positions)
+                if source_types:
+                    for section in SUMMARY_SECTIONS:
+                        for item in payload[section]:
+                            input_types = {
+                                item_type
+                                for position in item["evidence"]
+                                for item_type in source_types.get(position, set())
+                            }
+                            if item["type"] not in input_types:
+                                raise SummarizerError(
+                                    "Merge changed an item's evidence type"
+                                )
+                return payload
+            except SummarizerError as exc:
+                last_error = exc
+                if attempt == 0:
+                    prompt = [
+                        *messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                f"上次输出未通过校验：{exc}。"
+                                "请重新输出完整、合法且证据位置正确的 JSON。"
+                            ),
+                        },
+                    ]
+        raise last_error or SummarizerError("Unable to validate DeepSeek summary JSON")
 
     def _chat(self, messages: list[dict[str, str]]) -> str:
         payload: dict[str, Any] = {

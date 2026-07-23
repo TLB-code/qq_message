@@ -1,10 +1,16 @@
 import unittest
 import threading
 import time
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from app.onebot import message_display_parts, message_to_summary_text, parse_group_message
+from app.onebot import (
+    message_display_parts,
+    message_to_summary_text,
+    parse_group_message,
+    special_member_relations,
+)
 from app.server import (
     AUTO_SUMMARY_BATCH_LIMIT,
     DEFAULT_SUMMARY_LIMIT,
@@ -25,7 +31,21 @@ from app.server import (
     webhook_token_matches,
 )
 from app.storage import Message, Store
-from app.summarizer import DeepSeekClient, build_summary_prompt, compact_messages, split_messages
+from app.summarizer import (
+    DeepSeekClient,
+    SummarizerError,
+    build_summary_prompt,
+    compact_messages,
+    parse_summary_json,
+    prepare_messages,
+    render_summary,
+    split_messages,
+)
+
+
+EMPTY_SUMMARY_JSON = json.dumps(
+    {"topics": [], "actions": [], "attention": [], "special_member": []}
+)
 
 
 class AppTests(unittest.TestCase):
@@ -358,10 +378,10 @@ class AppTests(unittest.TestCase):
 
             def _chat(self, messages):
                 content = messages[-1]["content"]
-                if "合并为最终总结" in content:
-                    return "resumed final summary"
+                if "合并为" in content:
+                    return EMPTY_SUMMARY_JSON
                 self.chunk_calls.append(content)
-                return "new chunk summary"
+                return EMPTY_SUMMARY_JSON
 
         with TemporaryDirectory() as tmp:
             original_store = server.STORE
@@ -384,7 +404,7 @@ class AppTests(unittest.TestCase):
                 title="第 1/3 块",
                 message_count=2,
                 time_range="06-10 00:00 - 06-10 00:01",
-                summary="saved chunk summary",
+                summary=EMPTY_SUMMARY_JSON,
                 completed_at=107,
             )
             store.requeue_interrupted_summary_tasks()
@@ -402,7 +422,7 @@ class AppTests(unittest.TestCase):
             self.assertEqual(task["completed_chunks"], 3)
             self.assertEqual(len(client.chunk_calls), 2)
             self.assertFalse(any("第 1/3 块" in prompt for prompt in client.chunk_calls))
-            self.assertEqual(store.list_summaries("1", limit=1)[0]["summary"], "resumed final summary")
+            self.assertIn("暂无明确重点话题", store.list_summaries("1", limit=1)[0]["summary"])
 
     def test_store_pages_latest_unread_records_before_cursor(self):
         with TemporaryDirectory() as tmp:
@@ -819,7 +839,8 @@ class AppTests(unittest.TestCase):
 
         prompt = build_summary_prompt("test group", messages)
 
-        self.assertIn("魔女公主♪ 专属", prompt[-1]["content"])
+        self.assertIn('"special_member"', prompt[-1]["content"])
+        self.assertIn("魔女公主♪", prompt[-1]["content"])
 
     def test_summary_limit_is_one_batch(self):
         self.assertEqual(DEFAULT_SUMMARY_LIMIT, 5000)
@@ -861,9 +882,7 @@ class AppTests(unittest.TestCase):
 
             def _chat(self, messages):
                 self.calls.append(messages)
-                if "合并为最终总结" in messages[-1]["content"]:
-                    return "final summary"
-                return "chunk summary"
+                return EMPTY_SUMMARY_JSON
 
         messages = [
             Message(str(i), "1", "u", "user", f"message {i}", 1718000000 + i)
@@ -873,7 +892,7 @@ class AppTests(unittest.TestCase):
 
         summary = client.summarize("test group", messages)
 
-        self.assertEqual(summary, "final summary")
+        self.assertIn("暂无明确重点话题", summary)
         self.assertEqual(len(client.calls), 4)
         self.assertEqual(client.calls[-1][0]["role"], "system")
 
@@ -894,8 +913,8 @@ class AppTests(unittest.TestCase):
 
             def _chat(self, messages):
                 content = messages[-1]["content"]
-                if "合并为最终总结" in content:
-                    return "final summary"
+                if "合并为" in content:
+                    return EMPTY_SUMMARY_JSON
                 with self.lock:
                     self.active_chunk_calls += 1
                     self.max_active_chunk_calls = max(
@@ -905,7 +924,7 @@ class AppTests(unittest.TestCase):
                 time.sleep(0.05)
                 with self.lock:
                     self.active_chunk_calls -= 1
-                return "chunk summary"
+                return EMPTY_SUMMARY_JSON
 
         messages = [
             Message(str(i), "1", "u", "user", f"message {i}", 1718000000 + i)
@@ -915,8 +934,186 @@ class AppTests(unittest.TestCase):
 
         summary = client.summarize("test group", messages)
 
-        self.assertEqual(summary, "final summary")
+        self.assertIn("暂无明确重点话题", summary)
         self.assertGreaterEqual(client.max_active_chunk_calls, 2)
+
+    def test_summary_text_removes_nested_animated_sticker_placeholder(self):
+        self.assertEqual(
+            message_to_summary_text(None, None, fallback_content="[图片:[动画表情]]"),
+            "",
+        )
+        self.assertEqual(
+            message_to_summary_text(
+                None,
+                None,
+                fallback_content="重要文字 [图片:[动画表情]]",
+            ),
+            "重要文字",
+        )
+
+    def test_special_member_relations_use_qq_user_id(self):
+        replied = Message("10", "1", "special-qq", "已经改名", "原消息", 100)
+        message = [
+            {"type": "reply", "data": {"id": "10"}},
+            {"type": "at", "data": {"qq": "special-qq"}},
+            {"type": "text", "data": {"text": "请看"}},
+        ]
+
+        mentions, replies = special_member_relations(
+            None,
+            message,
+            "special-qq",
+            reply_lookup=lambda message_id: replied if message_id == "10" else None,
+        )
+
+        self.assertTrue(mentions)
+        self.assertTrue(replies)
+
+    def test_prepare_messages_uses_stable_alias_and_does_not_trust_nickname(self):
+        messages = [
+            Message("1", "1", "2829556413", "魔女公主♪", "本人", 100),
+            Message("2", "1", "1709094324", "魔女公主♪（伪）", "？", 101),
+            Message(
+                "3",
+                "1",
+                "1709094324",
+                "后来改名",
+                "@魔女公主♪(2829556413) @123456789 请看",
+                102,
+            ),
+        ]
+
+        prepared = prepare_messages(messages, "2829556413")
+
+        self.assertTrue(prepared[0].is_special_sender)
+        self.assertEqual(prepared[0].sender_alias, "重点成员")
+        self.assertFalse(prepared[1].is_special_sender)
+        self.assertEqual(prepared[1].sender_alias, prepared[2].sender_alias)
+        self.assertIn("@重点成员（魔女公主♪）", prepared[2].content)
+        self.assertIn("@某成员", prepared[2].content)
+        self.assertNotIn("2829556413", prepared[2].content)
+        self.assertNotIn("123456789", prepared[2].content)
+
+    def test_summary_json_requires_valid_and_special_evidence(self):
+        payload = {
+            "topics": [
+                {
+                    "title": "安排",
+                    "type": "confirmed_plan",
+                    "status": "待执行",
+                    "summary": "成员明确说明周五处理",
+                    "participants": ["成员001"],
+                    "evidence": [2],
+                }
+            ],
+            "actions": [],
+            "attention": [],
+            "special_member": [
+                {
+                    "title": "重点成员回复",
+                    "type": "confirmed_fact",
+                    "status": "",
+                    "summary": "重点成员进行了回复",
+                    "participants": ["重点成员"],
+                    "evidence": [1],
+                }
+            ],
+        }
+
+        parsed = parse_summary_json(json.dumps(payload), {1, 2}, {1})
+        self.assertEqual(parsed["special_member"][0]["evidence"], [1])
+
+        payload["special_member"][0]["evidence"] = [2]
+        with self.assertRaises(SummarizerError):
+            parse_summary_json(json.dumps(payload), {1, 2}, {1})
+
+    def test_render_summary_uses_program_computed_range_and_gap(self):
+        messages = [
+            Message("1", "1", "u1", "甲", "第一条", 100, position=1),
+            Message("2", "1", "u2", "乙", "第二条", 788, position=2),
+        ]
+        payload = {"topics": [], "actions": [], "attention": [], "special_member": []}
+
+        summary = render_summary(payload, messages, messages, 1, "魔女公主♪")
+
+        self.assertIn("原始消息 2 条", summary)
+        self.assertIn("最长间隔：11 分 28 秒", summary)
+
+    def test_requeue_discards_incompatible_pipeline_checkpoints(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "test.sqlite3")
+            store.init()
+            store.upsert_group("1", "test group", 100)
+            store.create_summary_task(
+                "old-task",
+                "1",
+                5000,
+                True,
+                101,
+                pipeline_version=1,
+            )
+            store.save_summary_task_chunk(
+                "old-task",
+                chunk_index=1,
+                title="old",
+                message_count=1,
+                time_range="old",
+                summary="old text format",
+                completed_at=102,
+            )
+
+            task_ids = store.requeue_interrupted_summary_tasks(pipeline_version=2)
+            task = store.get_summary_task("old-task")
+
+            self.assertEqual(task_ids, ["old-task"])
+            self.assertEqual(task["pipeline_version"], 2)
+            self.assertEqual(task["completed_chunks"], 0)
+            self.assertEqual(store.list_summary_task_chunks("old-task"), [])
+
+    def test_merge_rejects_evidence_type_promotion(self):
+        class PromotionClient(DeepSeekClient):
+            def __init__(self):
+                super().__init__(
+                    api_key="test",
+                    chunk_max_messages=1,
+                    chunk_max_chars=1000,
+                    merge_max_blocks=10,
+                    merge_max_chars=10000,
+                )
+
+            def _chat(self, messages):
+                content = messages[-1]["content"]
+                if "合并为最终结构" in content or "上次输出未通过校验" in content:
+                    item_type = "confirmed_fact"
+                    evidence = 1
+                else:
+                    item_type = "banter"
+                    evidence = 1 if "[#1]" in content else 2
+                return json.dumps(
+                    {
+                        "topics": [
+                            {
+                                "title": "线下玩笑",
+                                "type": item_type,
+                                "status": "",
+                                "summary": "成员开玩笑提到线下",
+                                "participants": ["成员001"],
+                                "evidence": [evidence],
+                            }
+                        ],
+                        "actions": [],
+                        "attention": [],
+                        "special_member": [],
+                    }
+                )
+
+        messages = [
+            Message("1", "1", "u1", "甲", "我要线下了（笑）", 100),
+            Message("2", "1", "u2", "乙", "玩笑回应", 101),
+        ]
+
+        with self.assertRaises(SummarizerError):
+            PromotionClient().summarize("test group", messages)
 
 
 if __name__ == "__main__":

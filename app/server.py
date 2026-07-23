@@ -24,9 +24,15 @@ from .onebot import (
     message_to_summary_text,
     message_to_text,
     parse_group_message,
+    special_member_relations,
 )
 from .storage import Message, Store
-from .summarizer import DeepSeekClient, SummarizerError, SummaryBlock
+from .summarizer import (
+    SUMMARY_PIPELINE_VERSION,
+    DeepSeekClient,
+    SummarizerError,
+    SummaryBlock,
+)
 
 
 SETTINGS = load_settings()
@@ -35,6 +41,8 @@ SUMMARIZER = DeepSeekClient(
     api_key=SETTINGS.deepseek_api_key,
     base_url=SETTINGS.deepseek_base_url,
     model=SETTINGS.deepseek_model,
+    special_member_user_id=SETTINGS.special_member_user_id,
+    special_member_display_name=SETTINGS.special_member_display_name,
 )
 STATIC_DIR = BASE_DIR / "frontend" / "dist"
 WEBHOOK_LOG_PATH = SETTINGS.database_path.parent / "webhook_events.log"
@@ -86,12 +94,21 @@ def message_from_record(record: dict, content: str | None = None) -> Message:
         sender_name=str(record["sender_name"]),
         content=str(record["content"] if content is None else content),
         timestamp=int(record["timestamp"]),
+        position=int(record.get("position") or 0),
     )
 
 
 def message_payload_from_record(record: dict) -> dict:
     event = raw_event_from_record(record)
-    payload = message_from_record(record).__dict__
+    message = message_from_record(record)
+    payload = {
+        "message_id": message.message_id,
+        "group_id": message.group_id,
+        "user_id": message.user_id,
+        "sender_name": message.sender_name,
+        "content": message.content,
+        "timestamp": message.timestamp,
+    }
     display_parts = message_display_parts(
         event.get("raw_message"),
         event.get("message"),
@@ -144,7 +161,25 @@ def summary_message_from_record(record: dict) -> Message | None:
     )
     if not content:
         return None
-    return message_from_record(record, content=content)
+    event = raw_event_from_record(record)
+    mentions_special, replies_to_special = special_member_relations(
+        event.get("raw_message"),
+        event.get("message"),
+        SETTINGS.special_member_user_id,
+        reply_lookup=STORE.get_message,
+    )
+    message = message_from_record(record, content=content)
+    return Message(
+        **{
+            **message.__dict__,
+            "is_special_sender": bool(
+                SETTINGS.special_member_user_id
+                and message.user_id == SETTINGS.special_member_user_id
+            ),
+            "mentions_special": mentions_special,
+            "replies_to_special": replies_to_special,
+        }
+    )
 
 
 def parse_history_date(value: str) -> tuple[int, int, str]:
@@ -248,17 +283,25 @@ def summarize_group_messages(group_id: str, limit: int, mark_read: bool = True) 
         raise ValueError("Group not found")
 
     records = STORE.get_unread_message_records(group_id, limit=limit)
-    messages = [message_from_record(record) for record in records]
+    positioned_records = [
+        {**record, "position": position}
+        for position, record in enumerate(records, start=1)
+    ]
+    messages = [message_from_record(record) for record in positioned_records]
     summary_messages = [
         message
-        for message in (summary_message_from_record(record) for record in records)
+        for message in (summary_message_from_record(record) for record in positioned_records)
         if message is not None
     ]
     if not messages:
         raise ValueError("No unread messages to summarize")
 
     if summary_messages:
-        summary = SUMMARIZER.summarize(group["group_name"], summary_messages)
+        summary = SUMMARIZER.summarize(
+            group["group_name"],
+            summary_messages,
+            source_messages=messages,
+        )
     else:
         summary = MEDIA_ONLY_SUMMARY
 
@@ -412,6 +455,7 @@ def process_manual_summary_task(task_id: str) -> dict | None:
                     plan_callback=save_plan,
                     chunk_callback=save_chunk,
                     stage_callback=lambda stage: STORE.set_summary_task_stage(task_id, stage),
+                    source_messages=messages,
                 )
             else:
                 STORE.set_summary_task_plan(task_id, 0)
@@ -1003,6 +1047,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             requested_limit=limit,
             mark_read=mark_read,
             created_at=int(time.time()),
+            pipeline_version=SUMMARY_PIPELINE_VERSION,
         )
         if created:
             MANUAL_SUMMARY_QUEUE.put(str(task["task_id"]))
@@ -1139,7 +1184,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 def run() -> None:
     STORE.init()
-    resumable_task_ids = STORE.requeue_interrupted_summary_tasks()
+    resumable_task_ids = STORE.requeue_interrupted_summary_tasks(SUMMARY_PIPELINE_VERSION)
     start_manual_summary_worker()
     for task_id in resumable_task_ids:
         MANUAL_SUMMARY_QUEUE.put(task_id)
@@ -1155,6 +1200,10 @@ def run() -> None:
         "Auto summary: "
         f"{'enabled' if SETTINGS.auto_summary_enabled else 'disabled'} "
         f"(threshold {SETTINGS.auto_summary_threshold})"
+    )
+    print(
+        "Special member summary: "
+        f"{'configured' if SETTINGS.special_member_user_id else 'disabled (missing QQ user_id)'}"
     )
     print(f"Static frontend: {STATIC_DIR} ({'built' if (STATIC_DIR / 'index.html').is_file() else 'missing build'})")
     if refresh_count:

@@ -35,6 +35,8 @@ QQ_SUMMARY_WEB_PASSWORD=use-a-strong-page-password
 
 QQ_SUMMARY_AUTO_SUMMARY_ENABLED=true
 QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD=500
+QQ_SUMMARY_SPECIAL_MEMBER_USER_ID=重点成员的QQ号
+QQ_SUMMARY_SPECIAL_MEMBER_DISPLAY_NAME=魔女公主♪
 ```
 
 不要把真实的 `DEEPSEEK_API_KEY`、`QQ_SUMMARY_WEBHOOK_TOKEN`、`QQ_SUMMARY_WEB_PASSWORD` 提交到 GitHub。
@@ -54,6 +56,8 @@ QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD=500
 | `QQ_SUMMARY_WEB_PASSWORD` | 建议填写 | `一个网页登录密码` | 网页访问密码。设置后，打开页面需要先登录；不设置则网页接口不需要登录。部署到服务器时强烈建议设置。 |
 | `QQ_SUMMARY_AUTO_SUMMARY_ENABLED` | 否 | `true` | 是否全局启用后台自动总结功能。开启后，还需要在网页里给具体群聊打开“自动总结”，那个群才会自动总结。 |
 | `QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD` | 否 | `500` | 自动总结阈值。某个已开启自动总结的群，未读历史消息达到这个数量后，后台会自动总结最早的一批消息。 |
+| `QQ_SUMMARY_SPECIAL_MEMBER_USER_ID` | 建议填写 | `重点成员的QQ号` | 专属总结使用的稳定身份。系统按 OneBot `user_id` 判断本人、@ 和回复关系，不按可能变化的昵称判断。 |
+| `QQ_SUMMARY_SPECIAL_MEMBER_DISPLAY_NAME` | 否 | `魔女公主♪` | 专属总结标题中显示的名称，只用于展示，不参与身份判断。 |
 
 ## 3. 构建前端
 

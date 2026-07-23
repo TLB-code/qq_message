@@ -16,6 +16,11 @@ class Message:
     sender_name: str
     content: str
     timestamp: int
+    position: int = 0
+    sender_alias: str = ""
+    is_special_sender: bool = False
+    mentions_special: bool = False
+    replies_to_special: bool = False
 
 
 class Store:
@@ -100,6 +105,7 @@ class Store:
                     created_at INTEGER NOT NULL,
                     started_at INTEGER,
                     completed_at INTEGER,
+                    pipeline_version INTEGER NOT NULL DEFAULT 2,
                     FOREIGN KEY (group_id) REFERENCES groups(group_id)
                 );
 
@@ -162,6 +168,7 @@ class Store:
                 "total_messages": "INTEGER NOT NULL DEFAULT 0",
                 "total_chunks": "INTEGER NOT NULL DEFAULT 0",
                 "completed_chunks": "INTEGER NOT NULL DEFAULT 0",
+                "pipeline_version": "INTEGER NOT NULL DEFAULT 1",
             }
             for column_name, definition in task_column_migrations.items():
                 if column_name not in task_columns:
@@ -532,6 +539,7 @@ class Store:
         requested_limit: int,
         mark_read: bool,
         created_at: int,
+        pipeline_version: int = 2,
     ) -> tuple[dict[str, Any], bool]:
         with self.connect() as conn:
             existing = conn.execute(
@@ -550,10 +558,18 @@ class Store:
                 conn.execute(
                     """
                     INSERT INTO summary_tasks (
-                        task_id, group_id, requested_limit, mark_read, status, stage, created_at
-                    ) VALUES (?, ?, ?, ?, 'queued', 'queued', ?)
+                        task_id, group_id, requested_limit, mark_read, status, stage,
+                        created_at, pipeline_version
+                    ) VALUES (?, ?, ?, ?, 'queued', 'queued', ?, ?)
                     """,
-                    (task_id, group_id, requested_limit, int(mark_read), created_at),
+                    (
+                        task_id,
+                        group_id,
+                        requested_limit,
+                        int(mark_read),
+                        created_at,
+                        pipeline_version,
+                    ),
                 )
             except sqlite3.IntegrityError:
                 existing = conn.execute(
@@ -633,7 +649,7 @@ class Store:
                 """,
                 [
                     (task_id, position, str(record["message_id"]))
-                    for position, record in enumerate(records)
+                    for position, record in enumerate(records, start=1)
                 ],
             )
             conn.execute(
@@ -649,7 +665,7 @@ class Store:
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT m.message_id, m.group_id, m.user_id, m.sender_name,
+                SELECT tm.position, m.message_id, m.group_id, m.user_id, m.sender_name,
                        m.content, m.timestamp, m.raw_json
                 FROM summary_task_messages tm
                 JOIN messages m ON m.message_id = tm.message_id
@@ -770,7 +786,7 @@ class Store:
                 (error, completed_at, task_id),
             )
 
-    def requeue_interrupted_summary_tasks(self) -> list[str]:
+    def requeue_interrupted_summary_tasks(self, pipeline_version: int = 2) -> list[str]:
         with self.connect() as conn:
             conn.execute(
                 """
@@ -779,6 +795,28 @@ class Store:
                 WHERE status = 'running'
                 """
             )
+            incompatible = conn.execute(
+                """
+                SELECT task_id FROM summary_tasks
+                WHERE status = 'queued' AND pipeline_version != ?
+                """,
+                (pipeline_version,),
+            ).fetchall()
+            incompatible_ids = [str(row["task_id"]) for row in incompatible]
+            if incompatible_ids:
+                conn.executemany(
+                    "DELETE FROM summary_task_chunks WHERE task_id = ?",
+                    [(task_id,) for task_id in incompatible_ids],
+                )
+                conn.executemany(
+                    """
+                    UPDATE summary_tasks
+                    SET pipeline_version = ?, stage = 'resuming', total_chunks = 0,
+                        completed_chunks = 0, error = NULL
+                    WHERE task_id = ?
+                    """,
+                    [(pipeline_version, task_id) for task_id in incompatible_ids],
+                )
             rows = conn.execute(
                 """
                 SELECT task_id FROM summary_tasks

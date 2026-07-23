@@ -32,10 +32,14 @@ $env:QQ_SUMMARY_WEBHOOK_TOKEN="use-a-long-random-token"
 $env:QQ_SUMMARY_WEB_PASSWORD="use-a-strong-page-password"
 $env:QQ_SUMMARY_AUTO_SUMMARY_ENABLED="true"
 $env:QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD="500"
+$env:QQ_SUMMARY_SPECIAL_MEMBER_USER_ID="重点成员的QQ号"
+$env:QQ_SUMMARY_SPECIAL_MEMBER_DISPLAY_NAME="魔女公主♪"
 ```
 
 DeepSeek's current OpenAI-compatible base URL is `https://api.deepseek.com`.
 When automatic summaries are enabled globally, you still choose which groups can use it from the web UI. Only selected groups are summarized in 500-message batches as soon as their unread message count reaches the threshold. This runs in the Python service and does not require the web page to be open.
+
+`QQ_SUMMARY_SPECIAL_MEMBER_USER_ID` uses QQ's stable OneBot `user_id` to identify the dedicated member section. Nicknames and group cards are display-only and may change; similar names such as `魔女公主♪（伪）` are not treated as the configured member.
 
 ## Run
 

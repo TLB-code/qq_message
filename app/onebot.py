@@ -14,7 +14,10 @@ CQ_PATTERN = re.compile(r"\[CQ:([a-zA-Z0-9_-]+)((?:,[^\]]*)?)\]")
 SUMMARY_EXCLUDED_SEGMENT_TYPES = {"image", "face", "mface", "bface", "marketface"}
 IMAGE_SEGMENT_TYPES = {"image"}
 STICKER_SEGMENT_TYPES = {"mface", "bface", "marketface"}
-MEDIA_PLACEHOLDER_PATTERN = re.compile(r"\[(?:图片|表情|表情包)(?::[^\]]*)?\]")
+MEDIA_PLACEHOLDER_PATTERN = re.compile(
+    r"\[(?:图片|表情|表情包)(?::(?:[^\[\]]|\[[^\[\]]*\])*)?\]"
+)
+MEANINGLESS_SUMMARY_TEXT_PATTERN = re.compile(r"^[\s\[\]()（）【】,，.。!！?？:：;；_\-]+$")
 
 
 def _cq_unescape(value: str) -> str:
@@ -175,6 +178,47 @@ def _message_to_segments(raw_message: Any, message: Any) -> list[dict[str, Any]]
     return []
 
 
+def special_member_relations(
+    raw_message: Any,
+    message: Any,
+    special_user_id: str | None,
+    reply_lookup: ReplyLookup | None = None,
+) -> tuple[bool, bool]:
+    if not special_user_id:
+        return False, False
+
+    mentions_special = False
+    replies_to_special = False
+    for segment in _message_to_segments(raw_message, message):
+        segment_type = str(segment.get("type") or "")
+        data = segment.get("data") or {}
+        if not isinstance(data, dict):
+            continue
+        if segment_type == "at" and str(data.get("qq") or "") == special_user_id:
+            mentions_special = True
+        elif segment_type == "reply" and reply_lookup is not None:
+            reply_id = data.get("id") or data.get("message_id")
+            if reply_id is None:
+                continue
+            replied_message = reply_lookup(str(reply_id))
+            if replied_message is not None and replied_message.user_id == special_user_id:
+                replies_to_special = True
+    return mentions_special, replies_to_special
+
+
+def _strip_media_placeholders(value: str) -> str:
+    previous = value
+    while True:
+        cleaned = MEDIA_PLACEHOLDER_PATTERN.sub("", previous)
+        if cleaned == previous:
+            break
+        previous = cleaned
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned or MEANINGLESS_SUMMARY_TEXT_PATTERN.fullmatch(cleaned):
+        return ""
+    return cleaned
+
+
 def _safe_media_url(value: Any) -> str:
     if not isinstance(value, str):
         return ""
@@ -286,7 +330,7 @@ def message_to_text(
         if "[CQ:" in message:
             return _segments_to_text(_raw_cq_to_segments(message), reply_lookup, excluded_segment_types)
         if excluded_segment_types:
-            return MEDIA_PLACEHOLDER_PATTERN.sub("", message).strip()
+            return _strip_media_placeholders(message)
         return message
 
     return ""
@@ -305,10 +349,8 @@ def message_to_summary_text(
         excluded_segment_types=SUMMARY_EXCLUDED_SEGMENT_TYPES,
     )
     if not text and fallback_content:
-        text = MEDIA_PLACEHOLDER_PATTERN.sub("", fallback_content)
-    else:
-        text = MEDIA_PLACEHOLDER_PATTERN.sub("", text)
-    return re.sub(r"\s+", " ", text).strip()
+        text = fallback_content
+    return _strip_media_placeholders(text)
 
 
 def parse_group_message(
