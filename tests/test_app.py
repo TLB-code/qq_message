@@ -1267,6 +1267,54 @@ class AppTests(unittest.TestCase):
         with self.assertRaises(SummarizerError):
             PromotionClient().summarize("test group", messages)
 
+    def test_merge_can_inherit_action_state_from_one_source_item(self):
+        class ActionMergeClient(DeepSeekClient):
+            def __init__(self):
+                super().__init__(
+                    api_key="test",
+                    chunk_max_messages=1,
+                    chunk_max_chars=1000,
+                    merge_max_blocks=10,
+                    merge_max_chars=10000,
+                )
+
+            def _chat(self, messages):
+                content = messages[-1]["content"]
+                if "当前待合并摘要数" in content or "候选事件：" in content:
+                    evidence = [1, 2]
+                    action_state = "decided"
+                elif "第 1/2 块" in content:
+                    evidence = [1]
+                    action_state = "decided"
+                elif "第 2/2 块" in content:
+                    evidence = [2]
+                    action_state = "none"
+                else:
+                    evidence = [1, 2]
+                    action_state = "decided"
+                return json.dumps(
+                    {
+                        "items": [
+                            {
+                                "title": "名单决定",
+                                "type": "confirmed_fact",
+                                "action_state": action_state,
+                                "attention_reason": "none",
+                                "claims": [{"text": "名单已经决定", "evidence": evidence}],
+                            }
+                        ]
+                    }
+                )
+
+        messages = [
+            Message("1", "1", "u1", "甲", "名单决定了", 100),
+            Message("2", "1", "u2", "乙", "收到", 101),
+        ]
+
+        summary = ActionMergeClient().summarize("test group", messages)
+
+        self.assertIn("已决定", summary)
+
 
 if __name__ == "__main__":
     unittest.main()

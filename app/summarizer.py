@@ -1209,16 +1209,20 @@ class DeepSeekClient:
                         ):
                             raise SummarizerError("Merge changed an item's evidence type")
                         if item["action_state"] != "none":
-                            if any(
-                                item["action_state"] not in source_actions.get(position, set())
+                            input_actions = {
+                                state
                                 for position in item["evidence"]
-                            ):
+                                for state in source_actions.get(position, set())
+                            }
+                            if item["action_state"] not in input_actions:
                                 raise SummarizerError("Merge promoted an item's action state")
                         if item["attention_reason"] != "none":
-                            if any(
-                                item["attention_reason"] not in source_attention.get(position, set())
+                            input_attention = {
+                                reason
                                 for position in item["evidence"]
-                            ):
+                                for reason in source_attention.get(position, set())
+                            }
+                            if item["attention_reason"] not in input_attention:
                                 raise SummarizerError("Merge promoted an item's attention reason")
                 return payload
             except SummarizerError as exc:
