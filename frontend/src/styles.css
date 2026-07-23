@@ -550,6 +550,22 @@ button:disabled {
   text-align: right;
 }
 
+.summary-events-toggle {
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  min-height: 30px;
+  flex: 0 0 30px;
+  border-color: rgb(15 104 98 / 24%);
+  background: rgb(255 255 255 / 72%);
+  padding: 0;
+  color: currentcolor;
+}
+
+.summary-events-toggle:hover:not(:disabled) {
+  background: #ffffff;
+}
+
 .summary-task-events {
   display: grid;
   gap: 5px;

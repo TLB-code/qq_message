@@ -113,8 +113,24 @@
             <progress :value="summaryProgressPercent" max="100" />
             <strong>{{ summaryProgressPercent }}%</strong>
           </div>
+          <button
+            v-if="visibleSummaryEvents.length"
+            class="summary-events-toggle"
+            type="button"
+            :title="summaryDetailsExpanded ? '收起总结过程' : '展开总结过程'"
+            :aria-label="summaryDetailsExpanded ? '收起总结过程' : '展开总结过程'"
+            :aria-expanded="summaryDetailsExpanded"
+            @click="summaryDetailsExpanded = !summaryDetailsExpanded"
+          >
+            <ChevronUp v-if="summaryDetailsExpanded" :size="17" />
+            <ChevronDown v-else :size="17" />
+          </button>
         </div>
-        <div v-if="visibleSummaryEvents.length" class="summary-task-events" aria-live="polite">
+        <div
+          v-if="visibleSummaryEvents.length && summaryDetailsExpanded"
+          class="summary-task-events"
+          aria-live="polite"
+        >
           <div
             v-for="event in visibleSummaryEvents"
             :key="event.id"
@@ -285,8 +301,10 @@ import {
   Archive,
   Bot,
   CheckCheck,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   CircleAlert,
   GripVertical,
   Inbox,
@@ -337,6 +355,7 @@ const markingSummaryReadIds = ref([]);
 const isRefreshing = ref(false);
 const isMutating = ref(false);
 const summaryLimitInput = ref("");
+const summaryDetailsExpanded = ref(true);
 const unreadPanel = ref(null);
 const historyPanel = ref(null);
 const panelGrid = ref(null);
@@ -861,7 +880,11 @@ async function refreshCurrentView({ silent = false, force = false } = {}) {
 }
 
 function setSummaryTask(task) {
-  summaryTask.taskId = task?.task_id || "";
+  const nextTaskId = task?.task_id || "";
+  if (nextTaskId && nextTaskId !== summaryTask.taskId) {
+    summaryDetailsExpanded.value = true;
+  }
+  summaryTask.taskId = nextTaskId;
   summaryTask.groupId = task?.group_id || "";
   summaryTask.status = task?.status || "";
   summaryTask.stage = task?.stage || "";
