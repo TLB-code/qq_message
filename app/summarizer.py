@@ -366,7 +366,15 @@ def parse_summary_json(
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise SummarizerError("DeepSeek did not return valid summary JSON") from exc
+        # Compatible endpoints may still wrap JSON output in a short explanation.
+        # Decode the first complete object without weakening the schema checks below.
+        object_start = text.find("{")
+        if object_start < 0:
+            raise SummarizerError("DeepSeek did not return valid summary JSON") from exc
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(text[object_start:])
+        except json.JSONDecodeError as nested_exc:
+            raise SummarizerError("DeepSeek did not return valid summary JSON") from nested_exc
     if not isinstance(payload, dict):
         raise SummarizerError("DeepSeek summary JSON must be an object")
 
@@ -914,7 +922,8 @@ class DeepSeekClient:
                             "role": "user",
                             "content": (
                                 f"上次输出未通过校验：{exc}。"
-                                "请重新输出完整、合法且证据位置正确的 JSON。"
+                                "请精简重复条目，重新输出完整、合法且证据位置正确的 JSON，"
+                                "并确保 JSON 在输出上限内完整结束。"
                             ),
                         },
                     ]
@@ -925,8 +934,9 @@ class DeepSeekClient:
             "model": self.model,
             "messages": messages,
             "temperature": 0.2,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
             "stream": False,
+            "response_format": {"type": "json_object"},
         }
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",

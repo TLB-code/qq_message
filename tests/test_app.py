@@ -1027,6 +1027,20 @@ class AppTests(unittest.TestCase):
         with self.assertRaises(SummarizerError):
             parse_summary_json(json.dumps(payload), {1, 2}, {1})
 
+    def test_summary_json_accepts_wrapped_json_object(self):
+        wrapped = (
+            "以下是 JSON 结果：\n"
+            '{"topics":[],"actions":[],"attention":[],"special_member":[]}\n'
+            "处理完毕。"
+        )
+
+        parsed = parse_summary_json(wrapped, set(), set())
+
+        self.assertEqual(
+            parsed,
+            {"topics": [], "actions": [], "attention": [], "special_member": []},
+        )
+
     def test_render_summary_uses_program_computed_range_and_gap(self):
         messages = [
             Message("1", "1", "u1", "甲", "第一条", 100, position=1),
