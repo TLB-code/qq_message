@@ -449,6 +449,7 @@ def parse_summary_json(
     for raw_item in raw_items:
         if not isinstance(raw_item, dict):
             raise SummarizerError("Summary contains a non-object item")
+        title = str(raw_item.get("title") or "").strip()
         item_type = str(raw_item.get("type") or "unknown").strip()
         action_state = str(raw_item.get("action_state") or "none").strip()
         attention_reason = str(raw_item.get("attention_reason") or "none").strip()
@@ -479,13 +480,21 @@ def parse_summary_json(
         }:
             raise SummarizerError("Decided or completed action has an incompatible evidence type")
         if attention_reason == "explicit_concern" and item_type != "reported_concern":
-            raise SummarizerError("Explicit concern requires reported_concern type")
+            raise SummarizerError(
+                "Explicit concern requires reported_concern type "
+                f"(item={title or '<untitled>'!r}, type={item_type!r})"
+            )
         if item_type == "reported_concern" and attention_reason != "explicit_concern":
-            raise SummarizerError("Reported concern requires an explicit concern reason")
+            raise SummarizerError(
+                "Reported concern requires an explicit concern reason "
+                f"(item={title or '<untitled>'!r}, attention_reason={attention_reason!r})"
+            )
         if attention_reason == "unresolved_disagreement" and item_type != "disagreement":
-            raise SummarizerError("Unresolved disagreement requires disagreement type")
+            raise SummarizerError(
+                "Unresolved disagreement requires disagreement type "
+                f"(item={title or '<untitled>'!r}, type={item_type!r})"
+            )
 
-        title = str(raw_item.get("title") or "").strip()
         raw_claims = raw_item.get("claims")
         if not title or not isinstance(raw_claims, list) or not raw_claims:
             raise SummarizerError("Every summary item needs a title and claims")
@@ -1196,7 +1205,7 @@ class DeepSeekClient:
             ) = self._block_evidence_metadata(source_blocks)
         last_error: SummarizerError | None = None
         prompt = list(messages)
-        for attempt in range(2):
+        for attempt in range(3):
             raw = self._chat(prompt)
             try:
                 payload = parse_summary_json(raw, allowed_positions, special_positions)
@@ -1227,14 +1236,22 @@ class DeepSeekClient:
                 return payload
             except SummarizerError as exc:
                 last_error = exc
-                if attempt == 0:
+                if attempt < 2:
                     prompt = [
                         *messages,
+                        {"role": "assistant", "content": raw},
                         {
                             "role": "user",
                             "content": (
                                 f"上次输出未通过校验：{exc}。"
-                                "请精简重复条目，重新输出完整、合法且证据位置正确的 JSON，"
+                                "请直接修正上面的 JSON，并重新输出完整结果。"
+                                "attention_reason=explicit_concern 只能搭配 type=reported_concern；"
+                                "如果一个条目混合了成员自述和他人明确担忧，必须按各自直接证据拆成"
+                                " self_report/none 与 reported_concern/explicit_concern 两个条目。"
+                                "attention_reason=unresolved_disagreement 只能搭配 type=disagreement。"
+                                "不得为了通过校验而升级、替换或编造证据类型；合并阶段只能沿用来源"
+                                "条目已有的 type、action_state 和 attention_reason。"
+                                "请同时精简重复条目，重新输出合法且证据位置正确的 JSON，"
                                 "并确保 JSON 在输出上限内完整结束。"
                             ),
                         },

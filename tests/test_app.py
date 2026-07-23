@@ -1085,6 +1085,79 @@ class AppTests(unittest.TestCase):
         with self.assertRaisesRegex(SummarizerError, "Reported concern"):
             parse_summary_json(json.dumps(payload), {1}, set())
 
+    def test_structured_retry_repairs_mixed_self_report_and_concern(self):
+        class ConcernRepairClient(DeepSeekClient):
+            def __init__(self):
+                super().__init__(api_key="test")
+                self.calls = []
+
+            def _chat(self, messages):
+                self.calls.append(messages)
+                if len(self.calls) == 1:
+                    return json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "title": "睡眠与群友担忧",
+                                    "type": "self_report",
+                                    "action_state": "none",
+                                    "attention_reason": "explicit_concern",
+                                    "claims": [
+                                        {"text": "成员001说自己没睡多久", "evidence": [1]},
+                                        {"text": "成员002明确劝其休息", "evidence": [2]},
+                                    ],
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    )
+                return json.dumps(
+                    {
+                        "items": [
+                            {
+                                "title": "睡眠自述",
+                                "type": "self_report",
+                                "action_state": "none",
+                                "attention_reason": "none",
+                                "claims": [
+                                    {"text": "成员001说自己没睡多久", "evidence": [1]}
+                                ],
+                            },
+                            {
+                                "title": "群友明确劝休息",
+                                "type": "reported_concern",
+                                "action_state": "none",
+                                "attention_reason": "explicit_concern",
+                                "claims": [
+                                    {"text": "成员002明确劝对方休息", "evidence": [2]}
+                                ],
+                            },
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+
+        client = ConcernRepairClient()
+        source_messages = prepare_messages(
+            [
+                Message("1", "1", "u1", "甲", "我没睡多久", 100),
+                Message("2", "1", "u2", "乙", "你快去休息吧", 101),
+            ],
+            None,
+        )
+
+        payload = client._chat_structured(
+            [{"role": "user", "content": "总结"}],
+            source_messages,
+        )
+
+        self.assertEqual(len(payload["items"]), 2)
+        self.assertEqual(payload["items"][0]["type"], "self_report")
+        self.assertEqual(payload["items"][1]["type"], "reported_concern")
+        self.assertEqual(client.calls[1][-2]["role"], "assistant")
+        self.assertIn('"explicit_concern"', client.calls[1][-2]["content"])
+        self.assertIn("必须按各自直接证据拆成", client.calls[1][-1]["content"])
+
     def test_confirmed_plan_is_programmatically_routed_as_open(self):
         payload = {
             "items": [
