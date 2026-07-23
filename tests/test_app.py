@@ -45,7 +45,7 @@ from app.summarizer import (
 
 
 EMPTY_SUMMARY_JSON = json.dumps(
-    {"topics": [], "actions": [], "attention": [], "special_member": []}
+    {"items": []}
 )
 
 
@@ -835,12 +835,13 @@ class AppTests(unittest.TestCase):
         self.assertLessEqual(len(compacted), 2200)
         self.assertIn("中间省略", compacted)
 
-    def test_summary_prompt_has_special_member_section(self):
+    def test_summary_prompt_has_special_member_identity_rules(self):
         messages = [Message("1", "1", "u", "魔女公主♪", "hello", 1718000000)]
 
         prompt = build_summary_prompt("test group", messages)
 
-        self.assertIn('"special_member"', prompt[-1]["content"])
+        self.assertIn('"items"', prompt[-1]["content"])
+        self.assertIn("重点成员本人", prompt[-1]["content"])
         self.assertIn("魔女公主♪", prompt[-1]["content"])
 
     def test_summary_limit_is_one_batch(self):
@@ -997,50 +998,173 @@ class AppTests(unittest.TestCase):
 
     def test_summary_json_requires_valid_and_special_evidence(self):
         payload = {
-            "topics": [
+            "items": [
                 {
                     "title": "安排",
                     "type": "confirmed_plan",
-                    "status": "待执行",
-                    "summary": "成员明确说明周五处理",
-                    "participants": ["成员001"],
-                    "evidence": [2],
-                }
-            ],
-            "actions": [],
-            "attention": [],
-            "special_member": [
+                    "action_state": "open",
+                    "attention_reason": "none",
+                    "claims": [{"text": "成员明确说明周五处理", "evidence": [2]}],
+                },
                 {
                     "title": "重点成员回复",
                     "type": "confirmed_fact",
-                    "status": "",
-                    "summary": "重点成员进行了回复",
-                    "participants": ["重点成员"],
-                    "evidence": [1],
-                }
+                    "action_state": "none",
+                    "attention_reason": "none",
+                    "claims": [{"text": "重点成员进行了回复", "evidence": [1]}],
+                },
             ],
         }
 
         parsed = parse_summary_json(json.dumps(payload), {1, 2}, {1})
-        self.assertEqual(parsed["special_member"][0]["evidence"], [1])
+        self.assertFalse(parsed["items"][0]["special_related"])
+        self.assertTrue(parsed["items"][1]["special_related"])
+        self.assertEqual(parsed["items"][1]["special_evidence"], [1])
 
-        payload["special_member"][0]["evidence"] = [2]
-        with self.assertRaises(SummarizerError):
+        payload["items"][1]["claims"][0]["evidence"] = [3]
+        with self.assertRaisesRegex(SummarizerError, "outside"):
             parse_summary_json(json.dumps(payload), {1, 2}, {1})
 
     def test_summary_json_accepts_wrapped_json_object(self):
         wrapped = (
             "以下是 JSON 结果：\n"
-            '{"topics":[],"actions":[],"attention":[],"special_member":[]}\n'
+            '{"items":[]}\n'
             "处理完毕。"
         )
 
         parsed = parse_summary_json(wrapped, set(), set())
 
-        self.assertEqual(
-            parsed,
-            {"topics": [], "actions": [], "attention": [], "special_member": []},
+        self.assertEqual(parsed, {"items": []})
+
+    def test_summary_json_accepts_hash_prefixed_evidence_positions(self):
+        payload = {
+            "items": [
+                {
+                    "title": "投票",
+                    "type": "proposal",
+                    "action_state": "open",
+                    "attention_reason": "none",
+                    "claims": [{"text": "正在收集名单", "evidence": ["#260"]}],
+                }
+            ]
+        }
+
+        parsed = parse_summary_json(json.dumps(payload), {260}, set())
+
+        self.assertEqual(parsed["items"][0]["claims"][0]["evidence"], [260])
+
+    def test_summary_json_rejects_banter_promoted_to_attention(self):
+        payload = {
+            "items": [
+                {
+                    "title": "象棋互怼",
+                    "type": "banter",
+                    "action_state": "none",
+                    "attention_reason": "explicit_concern",
+                    "claims": [{"text": "成员互相开玩笑", "evidence": [1]}],
+                }
+            ]
+        }
+
+        with self.assertRaisesRegex(SummarizerError, "Banter"):
+            parse_summary_json(json.dumps(payload), {1}, set())
+
+    def test_reported_concern_requires_explicit_attention_reason(self):
+        payload = {
+            "items": [
+                {
+                    "title": "普通转述",
+                    "type": "reported_concern",
+                    "action_state": "none",
+                    "attention_reason": "none",
+                    "claims": [{"text": "成员转述了一件事", "evidence": [1]}],
+                }
+            ]
+        }
+
+        with self.assertRaisesRegex(SummarizerError, "Reported concern"):
+            parse_summary_json(json.dumps(payload), {1}, set())
+
+    def test_confirmed_plan_is_programmatically_routed_as_open(self):
+        payload = {
+            "items": [
+                {
+                    "title": "周末补货",
+                    "type": "confirmed_plan",
+                    "action_state": "none",
+                    "attention_reason": "none",
+                    "claims": [{"text": "成员周末去补货", "evidence": [1]}],
+                }
+            ]
+        }
+
+        parsed = parse_summary_json(json.dumps(payload), {1}, set())
+
+        self.assertEqual(parsed["items"][0]["action_state"], "open")
+
+    def test_claim_cannot_reference_unrelated_member_alias(self):
+        messages = prepare_messages(
+            [
+                Message(str(index), "1", f"u{index}", f"用户{index}", "消息", 100 + index)
+                for index in range(1, 14)
+            ],
+            None,
         )
+        payload = {
+            "items": [
+                {
+                    "title": "身份测试",
+                    "type": "self_report",
+                    "action_state": "none",
+                    "attention_reason": "none",
+                    "special_related": False,
+                    "claims": [{"text": "成员009作出说明", "evidence": [13]}],
+                    "evidence": [13],
+                }
+            ]
+        }
+
+        with self.assertRaisesRegex(SummarizerError, "Claim aliases"):
+            DeepSeekClient._validate_claim_aliases(payload, messages)
+
+    def test_render_summary_derives_participants_and_ranks_overview(self):
+        messages = prepare_messages(
+            [
+                Message(str(index), "1", f"u{index}", f"用户{index}", f"消息{index}", 100 + index * 60, position=index)
+                for index in range(1, 9)
+            ],
+            None,
+        )
+        items = [
+            {
+                "title": f"短话题{index}",
+                "type": "confirmed_fact",
+                "action_state": "none",
+                "attention_reason": "none",
+                "special_related": False,
+                "claims": [{"text": f"成员{index:03d}发言", "evidence": [index]}],
+                "evidence": [index],
+            }
+            for index in range(1, 8)
+        ]
+        items.append(
+            {
+                "title": "持续投票",
+                "type": "proposal",
+                "action_state": "decided",
+                "attention_reason": "none",
+                "special_related": False,
+                "claims": [{"text": "群内持续进行名单投票", "evidence": [1, 3, 5, 8]}],
+                "evidence": [1, 3, 5, 8],
+            }
+        )
+
+        summary = render_summary({"items": items}, messages, messages, 1, "魔女公主♪")
+        overview = summary.split("## 重点话题", 1)[0]
+
+        self.assertIn("持续投票", overview)
+        self.assertIn("参与者：用户1、用户3、用户5、用户8", summary)
+        self.assertNotIn("成员001（用户1）", summary)
 
     def test_deepseek_client_retries_read_timeouts(self):
         client = DeepSeekClient(api_key="test", timeout=30, request_retries=2)
@@ -1062,7 +1186,7 @@ class AppTests(unittest.TestCase):
             Message("1", "1", "u1", "甲", "第一条", 100, position=1),
             Message("2", "1", "u2", "乙", "第二条", 788, position=2),
         ]
-        payload = {"topics": [], "actions": [], "attention": [], "special_member": []}
+        payload = {"items": []}
 
         summary = render_summary(payload, messages, messages, 1, "魔女公主♪")
 
@@ -1092,11 +1216,11 @@ class AppTests(unittest.TestCase):
                 completed_at=102,
             )
 
-            task_ids = store.requeue_interrupted_summary_tasks(pipeline_version=2)
+            task_ids = store.requeue_interrupted_summary_tasks(pipeline_version=3)
             task = store.get_summary_task("old-task")
 
             self.assertEqual(task_ids, ["old-task"])
-            self.assertEqual(task["pipeline_version"], 2)
+            self.assertEqual(task["pipeline_version"], 3)
             self.assertEqual(task["completed_chunks"], 0)
             self.assertEqual(store.list_summary_task_chunks("old-task"), [])
 
@@ -1121,19 +1245,17 @@ class AppTests(unittest.TestCase):
                     evidence = 1 if "[#1]" in content else 2
                 return json.dumps(
                     {
-                        "topics": [
+                        "items": [
                             {
                                 "title": "线下玩笑",
                                 "type": item_type,
-                                "status": "",
-                                "summary": "成员开玩笑提到线下",
-                                "participants": ["成员001"],
-                                "evidence": [evidence],
+                                "action_state": "none",
+                                "attention_reason": "none",
+                                "claims": [
+                                    {"text": "成员001开玩笑提到线下", "evidence": [evidence]}
+                                ],
                             }
-                        ],
-                        "actions": [],
-                        "attention": [],
-                        "special_member": [],
+                        ]
                     }
                 )
 

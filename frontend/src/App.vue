@@ -895,6 +895,8 @@ async function monitorSummaryTask(initialTask) {
       setStatus(`总结任务已进入后台队列，准备处理 ${expectedCount} 条消息...`);
     } else if (task.stage === "merging") {
       setStatus(`全部 ${task.total_chunks} 个分块已完成，正在合并最终总结...`);
+    } else if (task.stage === "reviewing") {
+      setStatus("最终总结已合并，正在逐条复核证据...");
     } else if (task.stage === "saving") {
       setStatus("最终总结已生成，正在保存结果...");
     } else if (task.total_chunks) {

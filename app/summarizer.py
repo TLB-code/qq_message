@@ -19,9 +19,8 @@ CHUNK_MAX_CHARS = 12000
 MERGE_MAX_BLOCKS = 12
 MERGE_MAX_CHARS = 18000
 CHUNK_PARALLELISM = 4
-SUMMARY_PIPELINE_VERSION = 2
+SUMMARY_PIPELINE_VERSION = 3
 DEFAULT_SPECIAL_MEMBER_NAME = "魔女公主♪"
-SUMMARY_SECTIONS = ("topics", "actions", "attention", "special_member")
 EVIDENCE_TYPES = {
     "confirmed_fact",
     "confirmed_plan",
@@ -32,8 +31,17 @@ EVIDENCE_TYPES = {
     "disagreement",
     "unknown",
 }
+ACTION_STATES = {"none", "open", "decided", "completed"}
+ATTENTION_REASONS = {
+    "none",
+    "explicit_request",
+    "explicit_concern",
+    "unresolved_disagreement",
+}
 NAMED_QQ_MENTION_PATTERN = re.compile(r"@([^()\s]{1,60})\((\d{5,12})\)")
 QQ_MENTION_PATTERN = re.compile(r"@(\d{5,12})\b")
+MEMBER_ALIAS_PATTERN = re.compile(r"成员\d{3}|重点成员")
+ESCALATION_PATTERN = re.compile(r"需要支援|需要回应|尚未解决|未解决|存在风险|需进一步讨论")
 
 
 class SummarizerError(RuntimeError):
@@ -223,43 +231,45 @@ def build_chunk_summary_prompt(
 ) -> list[dict[str, str]]:
     message_text = compact_messages(messages, max_chars=max_chars)
     system = (
-        "你是谨慎的 QQ 群消息事实提取助手。"
-        "只能依据提供的聊天记录，不得补充常识推断、诊断、动机或现实身份。"
-        "每个条目必须引用本块中真实存在的消息位置。"
+        "你是谨慎的 QQ 群消息事件提取助手。"
+        "只能依据聊天原文提取事件和逐项主张，不得补充常识、动机、风险、诊断或现实身份。"
+        "聊天可能同时交错多个话题，不能因为时间相近就把无关消息合并。"
     )
     user = f"""
 请总结 QQ 群「{group_name}」的第 {chunk_index}/{total_chunks} 块消息。
 本块共 {len(messages)} 条，时间范围：{_message_time_range(messages)}。
 
-只输出一个 JSON 对象，不要使用 Markdown 代码块。固定结构：
-{{
-  "topics": [条目],
-  "actions": [条目],
-  "attention": [条目],
-  "special_member": [条目]
-}}
-每个条目固定结构：
+只输出一个 JSON 对象，不要使用 Markdown。固定结构：{{"items": [事件]}}。
+每个事件固定结构：
 {{
   "title": "简短标题",
   "type": "证据类型",
-  "status": "明确状态，没有则为空字符串",
-  "summary": "严格依据原消息的中文归纳",
-  "participants": ["成员别名"],
-  "evidence": [消息位置数字]
+  "action_state": "行动状态",
+  "attention_reason": "关注原因",
+  "claims": [
+    {{"text": "只表达一个结论", "evidence": [直接支持该结论的消息位置]}}
+  ]
 }}
 
 证据类型只能使用：confirmed_fact、confirmed_plan、proposal、banter、self_report、reported_concern、disagreement、unknown。
+行动状态只能使用：none、open、decided、completed。
+关注原因只能使用：none、explicit_request、explicit_concern、unresolved_disagreement。
 规则：
-- 明确发生的事实用 confirmed_fact；明确承诺或安排才用 confirmed_plan；建议和意向用 proposal。
-- 玩笑、跟风、角色扮演、暧昧话术用 banter，绝不能改写成真实计划或风险。
+- 明确发生的事实用 confirmed_fact；明确承诺或未来安排用 confirmed_plan；建议和意向用 proposal。
+- 玩笑、跟风、角色扮演、暧昧话术用 banter，绝不能改写成真实计划、纠纷、求助或风险。
 - 成员对账号、金额、经历和健康的自述用 self_report，不得写成已核实事实。
 - 别人表达担忧用 reported_concern，不得升级为客观健康风险或诊断。
-- 不得把“没人回应”“尚未解决”“存在风险”作为结论，除非消息明确说明。
+- action_state=open 只用于有执行人且尚待执行的未来动作；decided 用于明确决定；已回答的问题不是待办。
+- attention_reason 只有原文明确请求处理、明确表达担忧或明确存在未决分歧时才能非 none。
+- type=banter 时 action_state 和 attention_reason 必须都是 none。
+- 不得自行写“没人回应”“尚未解决”“需要支援”“存在风险”“需要进一步讨论”。
 - 昵称可能是角色扮演，不得映射到现实同名人物；不得改变原词含义，例如“黄油”不能写成“黄图”。
-- actions 只放 confirmed_plan 或 proposal；attention 只放确实需要回复、明确争议或明确担忧的内容。
-- special_member 只允许引用带“重点成员本人”“@重点成员”或“回复重点成员”标记的消息。
-- “{special_member_name}”只是显示名称，重点成员身份只由上述标记确定。相似昵称、带“伪”的昵称都不是身份依据。
-- 合并重复刷屏，但尽量覆盖有实际信息的独立话题。每个条目保留 1-5 个最直接的证据位置。
+- “成员009”是系统别名，与昵称文字“009”完全不同；涉及成员时只能使用消息行方括号中的成员别名。
+- 不要输出 participants，参与者由程序根据每条 claim 的证据发送者生成。
+- 每条 claim 必须只引用直接支持自身文字的 1-5 条消息，不要加入仅仅时间相近的其他话题。
+- 看不到图片、转发和文件的实际内容，只能写群友文字中明确表达的信息。
+- 带“重点成员本人”“@重点成员”或“回复重点成员”的消息需要作为独立事件保留；“{special_member_name}”只是显示名。
+- 合并重复刷屏，但尽量覆盖有实际信息的独立话题、明确个人计划和群体决定。
 
 聊天记录：
 {message_text}
@@ -296,20 +306,21 @@ def build_merge_summary_prompt(
 ) -> list[dict[str, str]]:
     block_text = _summary_blocks_text(blocks)
     system = (
-        "你是 QQ 群结构化事实合并助手。"
-        "只能合并输入 JSON 中已有的信息，所有结论必须继续保留原始消息位置。"
-        "不得提升证据强度，不得把玩笑变成计划、把自述变成事实、把担忧变成客观风险。"
+        "你是 QQ 群结构化事件合并助手。"
+        "只能合并输入 JSON 已有的事件与主张，并保留原始证据位置。"
+        "不能添加事实，也不能把无关的并发对话合成一个事件。"
     )
     task = "请合并为最终结构" if final else "请合并为中间结构"
     output = f"""
-只输出 JSON，不要输出 Markdown。输出结构与输入完全相同：topics、actions、attention、special_member 四个数组。
-- 合并同一事件并合并 evidence，冲突观点必须保留，证据位置必须是输入中已有的数字。
+只输出 JSON，不要输出 Markdown。输出结构与输入完全相同：一个 items 数组。
+- 合并同一事件时保留 claims 与各自 evidence；不同结论不能共用不相关证据。
 - type 只能是：{', '.join(sorted(EVIDENCE_TYPES))}。
 - confirmed_plan、proposal、banter、self_report、reported_concern、disagreement 不能在合并时升级为 confirmed_fact。
-- actions 只放 confirmed_plan 或 proposal。
-- special_member 只能保留原来已在 special_member 中的条目，不得根据昵称重新识别。
-- “{special_member_name}”仅为显示名称，不代表昵称相似者。
-- 每个条目保留 1-8 个最直接的证据位置；不要生成消息中不存在的状态。
+- banter 不能改成行动、关注、纠纷或风险。
+- action_state、attention_reason 只能沿用输入已有状态或降级为 none，不得自行升级。
+- 不要输出参与者、状态描述、总览或 Markdown。
+- 重点成员身份只能由原事件的证据标记继承，不得根据昵称识别。“{special_member_name}”仅为显示名。
+- 每个 claim 保留 1-5 个最直接证据；删除重复事件，但不要漏掉跨多个分块持续发生的主要事件。
 """.strip()
 
     user = f"""
@@ -323,6 +334,46 @@ QQ群：{group_name}
 
 分块摘要：
 {block_text}
+""".strip()
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def build_review_summary_prompt(
+    group_name: str,
+    payload: dict[str, list[dict[str, Any]]],
+    messages: list[Message],
+) -> list[dict[str, str]]:
+    positions = {
+        position
+        for item in payload["items"]
+        for claim in item["claims"]
+        for position in claim["evidence"]
+    }
+    evidence_messages = [message for message in messages if message.position in positions]
+    system = (
+        "你是保守的摘要证据复核员。"
+        "只能删减、降级或纠正候选事件，不能加入候选中不存在的新事件、新结论或新证据。"
+        "证据不能直接支持主张时必须删除该主张；玩笑必须降级为 banter。"
+    )
+    user = f"""
+请复核 QQ 群「{group_name}」的候选事件。
+只输出与候选相同的 JSON 结构：{{"items": [...]}}。
+
+复核规则：
+- 每条 claim 的每个关键结论必须能从它自己的 evidence 原文直接读出。
+- 昵称“009”不能解释成系统别名“成员009”；只能相信消息行方括号中的发送者别名。
+- 不得把“赌狗”归给没有说这个词的人，不得把“太成熟/太老”改写成“要求换图”。
+- 游戏互怼、“杂鱼”“可恶”“退出某社”等语境默认是 banter，除非原文明示真实求助或担忧。
+- “需要回应、未解决、需要支援、存在风险”必须有原文直接依据，否则 attention_reason=none 并删除相关措辞。
+- 已经在证据中得到回答的问题不能是 open 行动。
+- 不得增加候选 evidence 之外的位置。允许删除无关证据、删除主张、拆分混杂事件或删除整个事件。
+- 不要输出 participants、Markdown 或解释。
+
+候选事件：
+{summary_json_text(payload)}
+
+候选事件引用的原消息：
+{compact_messages(evidence_messages, max_chars=MERGE_MAX_CHARS)}
 """.strip()
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -354,11 +405,7 @@ def split_summary_blocks(
     return batches
 
 
-def parse_summary_json(
-    value: str,
-    allowed_positions: set[int],
-    special_positions: set[int],
-) -> dict[str, list[dict[str, Any]]]:
+def _decode_json_object(value: str) -> dict[str, Any]:
     text = value.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
@@ -366,8 +413,6 @@ def parse_summary_json(
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
-        # Compatible endpoints may still wrap JSON output in a short explanation.
-        # Decode the first complete object without weakening the schema checks below.
         object_start = text.find("{")
         if object_start < 0:
             raise SummarizerError("DeepSeek did not return valid summary JSON") from exc
@@ -377,80 +422,239 @@ def parse_summary_json(
             raise SummarizerError("DeepSeek did not return valid summary JSON") from nested_exc
     if not isinstance(payload, dict):
         raise SummarizerError("DeepSeek summary JSON must be an object")
+    return payload
 
-    normalized: dict[str, list[dict[str, Any]]] = {}
-    for section in SUMMARY_SECTIONS:
-        raw_items = payload.get(section, [])
-        if not isinstance(raw_items, list):
-            raise SummarizerError(f"Summary section {section} must be an array")
-        items = []
-        for raw_item in raw_items:
-            if not isinstance(raw_item, dict):
-                raise SummarizerError(f"Summary section {section} contains a non-object item")
-            item_type = str(raw_item.get("type") or "unknown").strip()
-            if item_type not in EVIDENCE_TYPES:
-                raise SummarizerError(f"Unsupported evidence type: {item_type}")
-            if section == "actions" and item_type not in {"confirmed_plan", "proposal"}:
-                raise SummarizerError("Actions may only contain confirmed_plan or proposal items")
-            evidence_raw = raw_item.get("evidence")
-            if not isinstance(evidence_raw, list) or not evidence_raw:
-                raise SummarizerError("Every summary item must contain evidence positions")
+
+def _parse_evidence_position(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("boolean is not an evidence position")
+    if isinstance(value, str):
+        value = value.strip()
+        if value.startswith("#"):
+            value = value[1:].strip()
+    return int(value)
+
+
+def parse_summary_json(
+    value: str,
+    allowed_positions: set[int],
+    special_positions: set[int],
+) -> dict[str, list[dict[str, Any]]]:
+    payload = _decode_json_object(value)
+    raw_items = payload.get("items", [])
+    if not isinstance(raw_items, list):
+        raise SummarizerError("Summary items must be an array")
+
+    items: list[dict[str, Any]] = []
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            raise SummarizerError("Summary contains a non-object item")
+        item_type = str(raw_item.get("type") or "unknown").strip()
+        action_state = str(raw_item.get("action_state") or "none").strip()
+        attention_reason = str(raw_item.get("attention_reason") or "none").strip()
+        if item_type not in EVIDENCE_TYPES:
+            raise SummarizerError(f"Unsupported evidence type: {item_type}")
+        if action_state not in ACTION_STATES:
+            raise SummarizerError(f"Unsupported action state: {action_state}")
+        if attention_reason not in ATTENTION_REASONS:
+            raise SummarizerError(f"Unsupported attention reason: {attention_reason}")
+        if item_type == "confirmed_plan" and action_state == "none":
+            action_state = "open"
+        if item_type == "banter" and (action_state != "none" or attention_reason != "none"):
+            raise SummarizerError("Banter cannot be an action or attention item")
+        if item_type == "banter" and re.search(r"纠纷|求救|支援|风险|未解决", str(raw_item.get("title") or "")):
+            raise SummarizerError("Banter title cannot promote a joke into a real problem")
+        if action_state == "open" and item_type not in {
+            "confirmed_fact",
+            "confirmed_plan",
+            "proposal",
+            "self_report",
+        }:
+            raise SummarizerError("Open action has an incompatible evidence type")
+        if action_state in {"decided", "completed"} and item_type not in {
+            "confirmed_fact",
+            "confirmed_plan",
+            "proposal",
+            "self_report",
+        }:
+            raise SummarizerError("Decided or completed action has an incompatible evidence type")
+        if attention_reason == "explicit_concern" and item_type != "reported_concern":
+            raise SummarizerError("Explicit concern requires reported_concern type")
+        if item_type == "reported_concern" and attention_reason != "explicit_concern":
+            raise SummarizerError("Reported concern requires an explicit concern reason")
+        if attention_reason == "unresolved_disagreement" and item_type != "disagreement":
+            raise SummarizerError("Unresolved disagreement requires disagreement type")
+
+        title = str(raw_item.get("title") or "").strip()
+        raw_claims = raw_item.get("claims")
+        if not title or not isinstance(raw_claims, list) or not raw_claims:
+            raise SummarizerError("Every summary item needs a title and claims")
+        claims = []
+        item_positions: list[int] = []
+        for raw_claim in raw_claims[:6]:
+            if not isinstance(raw_claim, dict):
+                raise SummarizerError("Summary claim must be an object")
+            claim_text = str(raw_claim.get("text") or "").strip()
+            evidence_raw = raw_claim.get("evidence")
+            if not claim_text or not isinstance(evidence_raw, list) or not evidence_raw:
+                raise SummarizerError("Every claim needs text and evidence")
             try:
-                evidence = list(dict.fromkeys(int(position) for position in evidence_raw))
+                evidence = list(
+                    dict.fromkeys(_parse_evidence_position(position) for position in evidence_raw)
+                )[:5]
             except (TypeError, ValueError) as exc:
                 raise SummarizerError("Evidence positions must be integers") from exc
             if any(position not in allowed_positions for position in evidence):
                 raise SummarizerError("Summary referenced a message outside the provided input")
-            if section == "special_member" and not special_positions.intersection(evidence):
-                raise SummarizerError("Special member item has no QQ-verified evidence")
-
-            title = str(raw_item.get("title") or "").strip()
-            summary = str(raw_item.get("summary") or "").strip()
-            if not title or not summary:
-                raise SummarizerError("Every summary item needs a title and summary")
-            participants_raw = raw_item.get("participants") or []
-            participants = (
-                [str(participant).strip() for participant in participants_raw if str(participant).strip()]
-                if isinstance(participants_raw, list)
-                else []
-            )
-            items.append(
-                {
-                    "title": title,
-                    "type": item_type,
-                    "status": str(raw_item.get("status") or "").strip(),
-                    "summary": summary,
-                    "participants": list(dict.fromkeys(participants))[:12],
-                    "evidence": evidence[:8],
-                }
-            )
-        normalized[section] = items
-    return normalized
+            if attention_reason == "none" and ESCALATION_PATTERN.search(claim_text):
+                raise SummarizerError("Claim added an unsupported attention conclusion")
+            claims.append({"text": claim_text, "evidence": evidence})
+            item_positions.extend(evidence)
+        evidence = list(dict.fromkeys(item_positions))
+        special_evidence = [position for position in evidence if position in special_positions]
+        items.append(
+            {
+                "title": title,
+                "type": item_type,
+                "action_state": action_state,
+                "attention_reason": attention_reason,
+                "special_related": bool(special_evidence),
+                "special_evidence": special_evidence,
+                "claims": claims,
+                "evidence": evidence,
+            }
+        )
+    return {"items": items}
 
 
 def summary_json_text(payload: dict[str, list[dict[str, Any]]]) -> str:
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    serializable = {
+        "items": [
+            {
+                "title": item["title"],
+                "type": item["type"],
+                "action_state": item["action_state"],
+                "attention_reason": item["attention_reason"],
+                "special_related": item["special_related"],
+                "special_evidence": item["special_evidence"],
+                "claims": item["claims"],
+            }
+            for item in payload["items"]
+        ]
+    }
+    return json.dumps(serializable, ensure_ascii=False, separators=(",", ":"))
 
 
-def _evidence_label(item: dict[str, Any], messages_by_position: dict[int, Message]) -> str:
-    labels = []
+def _display_names(messages: list[Message], special_member_name: str) -> dict[str, str]:
+    latest_names: dict[str, str] = {}
+    for message in messages:
+        if message.sender_alias:
+            latest_names[message.sender_alias] = message.sender_name
+    name_counts: dict[str, int] = {}
+    for name in latest_names.values():
+        name_counts[name] = name_counts.get(name, 0) + 1
+    return {
+        alias: (
+            special_member_name
+            if alias == "重点成员"
+            else f"{name}（{alias}）"
+            if name_counts[name] > 1
+            else name
+        )
+        for alias, name in latest_names.items()
+    }
+
+
+def _replace_aliases(text: str, display_names: dict[str, str]) -> str:
+    return MEMBER_ALIAS_PATTERN.sub(lambda match: display_names.get(match.group(0), match.group(0)), text)
+
+
+def _item_participants(
+    item: dict[str, Any],
+    messages_by_position: dict[int, Message],
+) -> list[str]:
+    aliases = []
     for position in item["evidence"]:
-        message = messages_by_position.get(int(position))
-        if message is None:
+        message = messages_by_position.get(position)
+        if message and message.sender_alias and message.sender_alias not in aliases:
+            aliases.append(message.sender_alias)
+    return aliases[:12]
+
+
+def _merge_duplicate_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    for item in items:
+        evidence = set(item["evidence"])
+        duplicate = next(
+            (
+                existing
+                for existing in merged
+                if existing["type"] == item["type"]
+                and evidence
+                and set(existing["evidence"])
+                and len(evidence & set(existing["evidence"]))
+                / min(len(evidence), len(set(existing["evidence"])))
+                >= 0.8
+            ),
+            None,
+        )
+        if duplicate is None:
+            merged.append(item)
             continue
-        labels.append(f"#{position} {_format_time(message.timestamp)}")
+        seen = {(claim["text"], tuple(claim["evidence"])) for claim in duplicate["claims"]}
+        duplicate["claims"].extend(
+            claim
+            for claim in item["claims"]
+            if (claim["text"], tuple(claim["evidence"])) not in seen
+        )
+        duplicate["evidence"] = list(dict.fromkeys([*duplicate["evidence"], *item["evidence"]]))
+        duplicate["special_related"] = duplicate["special_related"] or item["special_related"]
+        duplicate["special_evidence"] = list(
+            dict.fromkeys(
+                [*duplicate.get("special_evidence", []), *item.get("special_evidence", [])]
+            )
+        )
+    return merged
+
+
+def _item_score(
+    item: dict[str, Any],
+    messages_by_position: dict[int, Message],
+) -> float:
+    evidence_messages = [messages_by_position[p] for p in item["evidence"] if p in messages_by_position]
+    participants = {message.user_id for message in evidence_messages}
+    duration = 0
+    if len(evidence_messages) > 1:
+        duration = max(message.timestamp for message in evidence_messages) - min(
+            message.timestamp for message in evidence_messages
+        )
+    score = len(item["evidence"]) + min(len(participants), 6) * 1.5 + min(duration / 60, 6)
+    if item["action_state"] in {"open", "decided"}:
+        score += 3
+    if item["attention_reason"] != "none":
+        score += 2
+    if item["type"] == "banter":
+        score -= 3
+    return score
+
+
+def _evidence_label(positions: list[int], messages_by_position: dict[int, Message]) -> str:
+    labels = []
+    for position in positions:
+        message = messages_by_position.get(position)
+        if message is not None:
+            labels.append(f"#{position} {_format_time(message.timestamp)}")
     return "、".join(labels)
 
 
 def _render_items(
     items: list[dict[str, Any]],
     messages_by_position: dict[int, Message],
-    participant_names: dict[str, str],
+    display_names: dict[str, str],
     empty_text: str,
 ) -> list[str]:
     if not items:
         return [empty_text]
-    lines = []
     type_labels = {
         "confirmed_fact": "已确认事实",
         "confirmed_plan": "明确安排",
@@ -459,27 +663,31 @@ def _render_items(
         "self_report": "成员自述",
         "reported_concern": "群友担忧",
         "disagreement": "存在分歧",
-        "unknown": "信息不足",
+        "unknown": "原文信息",
     }
+    action_labels = {"open": "待执行", "decided": "已决定", "completed": "已完成"}
+    attention_labels = {
+        "explicit_request": "明确请求",
+        "explicit_concern": "明确担忧",
+        "unresolved_disagreement": "未决分歧",
+    }
+    lines = []
     for item in items:
         details = [type_labels[item["type"]]]
-        if item["status"]:
-            details.append(item["status"])
-        participants = "、".join(
-            (
-                f"{participant}（{participant_names[participant]}）"
-                if participant in participant_names
-                else participant
-            )
-            for participant in item["participants"]
-        )
-        if participants:
-            details.append(f"参与者：{participants}")
-        evidence = _evidence_label(item, messages_by_position)
-        lines.append(
-            f"**{item['title']}**（{'；'.join(details)}）：{item['summary']}"
-            + (f" [证据：{evidence}]" if evidence else "")
-        )
+        if item["action_state"] != "none":
+            details.append(action_labels[item["action_state"]])
+        if item["attention_reason"] != "none":
+            details.append(attention_labels[item["attention_reason"]])
+        aliases = _item_participants(item, messages_by_position)
+        if aliases:
+            details.append(f"参与者：{'、'.join(display_names.get(alias, alias) for alias in aliases)}")
+        claims = []
+        for claim in item["claims"]:
+            claim_text = _replace_aliases(claim["text"], display_names)
+            evidence = _evidence_label(claim["evidence"], messages_by_position)
+            claims.append(claim_text + (f" [证据：{evidence}]" if evidence else ""))
+        title = _replace_aliases(item["title"], display_names)
+        lines.append(f"**{title}**（{'；'.join(details)}）：{'；'.join(claims)}")
     return lines
 
 
@@ -491,48 +699,54 @@ def render_summary(
     special_member_name: str,
 ) -> str:
     messages_by_position = {message.position: message for message in summary_messages}
-    participant_names = {
-        message.sender_alias: message.sender_name
-        for message in summary_messages
-        if message.sender_alias
-    }
-    topic_items = payload["topics"]
-    overview = [item["summary"] for item in topic_items[:6]]
+    display_names = _display_names(summary_messages, special_member_name)
+    items = _merge_duplicate_items([dict(item) for item in payload["items"]])
+    attention_items = [item for item in items if item["attention_reason"] != "none"]
+    action_items = [
+        item
+        for item in items
+        if item["attention_reason"] == "none" and item["action_state"] in {"open", "decided"}
+    ]
+    topic_items = [
+        item
+        for item in items
+        if item not in attention_items
+        and item not in action_items
+        and not (
+            item["special_related"]
+            and item["type"] == "banter"
+            and len(item["evidence"]) <= 3
+        )
+    ]
+    special_items = [item for item in items if item["special_related"]]
+    overview_items = sorted(
+        items,
+        key=lambda item: _item_score(item, messages_by_position),
+        reverse=True,
+    )[:6]
+
     lines = ["## 总览"]
-    lines.extend(f"- {item}" for item in overview or ["本批消息没有可确认的文本话题。"])
+    if overview_items:
+        for item in overview_items:
+            overview_text = "；".join(
+                _replace_aliases(claim["text"], display_names) for claim in item["claims"]
+            )
+            title = _replace_aliases(item["title"], display_names)
+            lines.append(f"- **{title}**：{overview_text}")
+    else:
+        lines.append("- 本批消息没有可确认的文本话题。")
     lines.extend(["", "## 重点话题"])
-    lines.extend(
-        _render_items(
-            topic_items,
-            messages_by_position,
-            participant_names,
-            "暂无明确重点话题。",
-        )
-    )
+    lines.extend(_render_items(topic_items, messages_by_position, display_names, "暂无明确重点话题。"))
     lines.extend(["", "## 待办/决定"])
-    lines.extend(
-        _render_items(
-            payload["actions"],
-            messages_by_position,
-            participant_names,
-            "暂无明确待办。",
-        )
-    )
+    lines.extend(_render_items(action_items, messages_by_position, display_names, "暂无明确待办。"))
     lines.extend(["", "## 需要关注"])
-    lines.extend(
-        _render_items(
-            payload["attention"],
-            messages_by_position,
-            participant_names,
-            "暂无特别需要关注。",
-        )
-    )
+    lines.extend(_render_items(attention_items, messages_by_position, display_names, "暂无特别需要关注。"))
     lines.extend(["", f"## {special_member_name} 专属"])
     lines.extend(
         _render_items(
-            payload["special_member"],
+            special_items,
             messages_by_position,
-            participant_names,
+            display_names,
             f"暂无与 {special_member_name} QQ 身份直接关联的内容。",
         )
     )
@@ -621,6 +835,7 @@ class DeepSeekClient:
                     {message.position for message in messages},
                     self._special_positions(messages),
                 )
+                payload = self._review_payload(group_name, payload, messages, stage_callback)
                 return render_summary(
                     payload,
                     messages,
@@ -645,6 +860,7 @@ class DeepSeekClient:
             )
             if chunk_callback:
                 chunk_callback(1, block)
+            payload = self._review_payload(group_name, payload, messages, stage_callback)
             return render_summary(
                 payload,
                 messages,
@@ -668,6 +884,7 @@ class DeepSeekClient:
                     {message.position for message in chunks[0]},
                     self._special_positions(chunks[0]),
                 )
+                payload = self._review_payload(group_name, payload, messages, stage_callback)
                 return render_summary(
                     payload,
                     messages,
@@ -692,6 +909,7 @@ class DeepSeekClient:
             )
             if chunk_callback:
                 chunk_callback(1, block)
+            payload = self._review_payload(group_name, payload, messages, stage_callback)
             return render_summary(
                 payload,
                 messages,
@@ -751,6 +969,7 @@ class DeepSeekClient:
             total_chunk_count=len(chunks),
             messages=messages,
         )
+        payload = self._review_payload(group_name, payload, messages, stage_callback)
         return render_summary(
             payload,
             messages,
@@ -758,6 +977,34 @@ class DeepSeekClient:
             len(chunks),
             self.special_member_display_name,
         )
+
+    def _review_payload(
+        self,
+        group_name: str,
+        payload: dict[str, list[dict[str, Any]]],
+        messages: list[Message],
+        stage_callback: Callable[[str], None] | None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        if not payload["items"]:
+            return payload
+        if stage_callback:
+            stage_callback("reviewing")
+        allowed_positions = {
+            position
+            for item in payload["items"]
+            for claim in item["claims"]
+            for position in claim["evidence"]
+        }
+        evidence_messages = [message for message in messages if message.position in allowed_positions]
+        reviewed = self._chat_structured(
+            build_review_summary_prompt(group_name, payload, messages),
+            evidence_messages,
+        )
+        original_evidence_sets = [set(item["evidence"]) for item in payload["items"]]
+        for item in reviewed["items"]:
+            if not any(set(item["evidence"]).issubset(source) for source in original_evidence_sets):
+                raise SummarizerError("Evidence review mixed evidence from different candidate events")
+        return reviewed
 
     def _merge_summary_blocks(
         self,
@@ -856,34 +1103,78 @@ class DeepSeekClient:
             return set()
         return {
             int(position)
-            for section in SUMMARY_SECTIONS
-            for item in payload.get(section, [])
+            for item in payload.get("items", [])
             if isinstance(item, dict)
-            for position in item.get("evidence", [])
+            for claim in item.get("claims", [])
+            if isinstance(claim, dict)
+            for position in claim.get("evidence", [])
         }
 
     @staticmethod
     def _block_evidence_metadata(
         blocks: list[SummaryBlock],
-    ) -> tuple[dict[int, set[str]], set[int]]:
+    ) -> tuple[
+        dict[int, set[str]],
+        dict[int, set[str]],
+        dict[int, set[str]],
+        set[int],
+    ]:
         types_by_position: dict[int, set[str]] = {}
+        actions_by_position: dict[int, set[str]] = {}
+        attention_by_position: dict[int, set[str]] = {}
         special_positions: set[int] = set()
         for block in blocks:
             try:
                 payload = json.loads(block.content)
             except json.JSONDecodeError:
                 continue
-            for section in SUMMARY_SECTIONS:
-                for item in payload.get(section, []):
-                    if not isinstance(item, dict):
+            for item in payload.get("items", []):
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type") or "unknown")
+                action_state = str(item.get("action_state") or "none")
+                attention_reason = str(item.get("attention_reason") or "none")
+                for claim in item.get("claims", []):
+                    if not isinstance(claim, dict):
                         continue
-                    item_type = str(item.get("type") or "unknown")
-                    for raw_position in item.get("evidence", []):
+                    for raw_position in claim.get("evidence", []):
                         position = int(raw_position)
                         types_by_position.setdefault(position, set()).add(item_type)
-                        if section == "special_member":
-                            special_positions.add(position)
-        return types_by_position, special_positions
+                        actions_by_position.setdefault(position, set()).add(action_state)
+                        attention_by_position.setdefault(position, set()).add(attention_reason)
+                special_positions.update(int(position) for position in item.get("special_evidence", []))
+        return types_by_position, actions_by_position, attention_by_position, special_positions
+
+    @staticmethod
+    def _validate_claim_aliases(
+        payload: dict[str, list[dict[str, Any]]],
+        messages: list[Message],
+    ) -> None:
+        messages_by_position = {message.position: message for message in messages}
+        for item in payload["items"]:
+            item_aliases = set(MEMBER_ALIAS_PATTERN.findall(item["title"]))
+            item_allowed_aliases = set()
+            for position in item["evidence"]:
+                message = messages_by_position.get(position)
+                if message is None:
+                    continue
+                if message.sender_alias:
+                    item_allowed_aliases.add(message.sender_alias)
+                item_allowed_aliases.update(MEMBER_ALIAS_PATTERN.findall(message.content))
+            if not item_aliases.issubset(item_allowed_aliases):
+                unsupported = sorted(item_aliases - item_allowed_aliases)
+                raise SummarizerError(
+                    "Title aliases "
+                    f"{unsupported} are outside event evidence aliases {sorted(item_allowed_aliases)}"
+                )
+            for claim in item["claims"]:
+                referenced_aliases = set(MEMBER_ALIAS_PATTERN.findall(claim["text"]))
+                if not referenced_aliases.issubset(item_allowed_aliases):
+                    unsupported = sorted(referenced_aliases - item_allowed_aliases)
+                    raise SummarizerError(
+                        "Claim aliases "
+                        f"{unsupported} are outside event evidence aliases {sorted(item_allowed_aliases)}"
+                    )
 
     def _chat_structured(
         self,
@@ -894,26 +1185,41 @@ class DeepSeekClient:
         allowed_positions = {message.position for message in source_messages}
         special_positions = self._special_positions(source_messages)
         source_types: dict[int, set[str]] = {}
+        source_actions: dict[int, set[str]] = {}
+        source_attention: dict[int, set[str]] = {}
         if source_blocks is not None:
-            source_types, special_positions = self._block_evidence_metadata(source_blocks)
+            (
+                source_types,
+                source_actions,
+                source_attention,
+                special_positions,
+            ) = self._block_evidence_metadata(source_blocks)
         last_error: SummarizerError | None = None
         prompt = list(messages)
         for attempt in range(2):
             raw = self._chat(prompt)
             try:
                 payload = parse_summary_json(raw, allowed_positions, special_positions)
+                self._validate_claim_aliases(payload, source_messages)
                 if source_types:
-                    for section in SUMMARY_SECTIONS:
-                        for item in payload[section]:
-                            input_types = {
-                                item_type
+                    for item in payload["items"]:
+                        if any(
+                            item["type"] not in source_types.get(position, set())
+                            for position in item["evidence"]
+                        ):
+                            raise SummarizerError("Merge changed an item's evidence type")
+                        if item["action_state"] != "none":
+                            if any(
+                                item["action_state"] not in source_actions.get(position, set())
                                 for position in item["evidence"]
-                                for item_type in source_types.get(position, set())
-                            }
-                            if item["type"] not in input_types:
-                                raise SummarizerError(
-                                    "Merge changed an item's evidence type"
-                                )
+                            ):
+                                raise SummarizerError("Merge promoted an item's action state")
+                        if item["attention_reason"] != "none":
+                            if any(
+                                item["attention_reason"] not in source_attention.get(position, set())
+                                for position in item["evidence"]
+                            ):
+                                raise SummarizerError("Merge promoted an item's attention reason")
                 return payload
             except SummarizerError as exc:
                 last_error = exc
