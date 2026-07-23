@@ -1298,6 +1298,7 @@ class DeepSeekClient:
         def summarize_fast_chunk(item: tuple[int, list[Message]]) -> SummaryBlock:
             nonlocal completed_count
             index, chunk = item
+            used_local_fallback = False
             _emit_progress(
                 progress_callback,
                 "summarizing",
@@ -1308,12 +1309,40 @@ class DeepSeekClient:
                 round(85 * completed_count / len(chunks)),
             )
             try:
-                content = self._chat_text(
-                    build_fast_chunk_prompt(group_name, chunk, index, len(chunks)),
-                    max_tokens=2048,
-                )
-                if not content.strip():
-                    raise SummarizerError("DeepSeek returned an empty fast chunk summary")
+                prompt = build_fast_chunk_prompt(group_name, chunk, index, len(chunks))
+                content = str(self._chat_text(prompt, max_tokens=2048) or "").strip()
+                if not content:
+                    _emit_progress(
+                        progress_callback,
+                        "summarizing",
+                        "warning",
+                        f"快速分块 {index}/{len(chunks)} 返回空内容，正在重试。",
+                        completed_count,
+                        len(chunks),
+                        round(85 * completed_count / len(chunks)),
+                    )
+                    retry_prompt = [
+                        *prompt,
+                        {
+                            "role": "user",
+                            "content": (
+                                "上一次响应为空。请重新输出本分块的简洁 Markdown 摘要；"
+                                "最多保留 5 个重点，每个重点一句话，必须输出可见文字。"
+                            ),
+                        },
+                    ]
+                    content = str(
+                        self._chat_text(retry_prompt, max_tokens=1536) or ""
+                    ).strip()
+                if not content:
+                    used_local_fallback = True
+                    content = self._render_fast_chunk_fallback(chunk)
+                    print(
+                        "Summary warning: "
+                        f"fast chunk {index}/{len(chunks)} returned empty twice; "
+                        "using a local message excerpt",
+                        flush=True,
+                    )
             except Exception:
                 _emit_progress(
                     progress_callback,
@@ -1343,8 +1372,13 @@ class DeepSeekClient:
             _emit_progress(
                 progress_callback,
                 "summarizing",
-                "success",
-                f"快速分块 {index}/{len(chunks)} 已完成。",
+                "warning" if used_local_fallback else "success",
+                (
+                    f"快速分块 {index}/{len(chunks)} 连续返回空内容，"
+                    "已使用本地原文摘录继续。"
+                    if used_local_fallback
+                    else f"快速分块 {index}/{len(chunks)} 已完成。"
+                ),
                 current,
                 len(chunks),
                 round(85 * current / len(chunks)),
@@ -1438,6 +1472,15 @@ class DeepSeekClient:
                 ),
             ]
         ).strip()
+
+    @staticmethod
+    def _render_fast_chunk_fallback(messages: list[Message]) -> str:
+        excerpt = compact_text(
+            "\n".join(_format_fast_message_line(message) for message in messages),
+            FAST_CHUNK_OUTPUT_MAX_CHARS - 80,
+            marker="\n...中间原文省略...\n",
+        )
+        return "### 本地原文摘录\nAI 未返回本分块摘要，以下内容用于最终整理：\n" + excerpt
 
     @staticmethod
     def _render_fast_fallback(blocks: list[SummaryBlock], special_member_name: str) -> str:

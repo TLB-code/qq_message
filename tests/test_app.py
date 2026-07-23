@@ -1850,6 +1850,47 @@ class AppTests(unittest.TestCase):
             any(event[0] == "finalizing" and event[1] == "warning" for event in progress_events)
         )
 
+    def test_fast_summary_uses_local_excerpt_when_chunk_stays_empty(self):
+        class EmptyChunkClient(DeepSeekClient):
+            def __init__(self):
+                super().__init__(api_key="test")
+
+            def _chat_text(self, messages, max_tokens):
+                prompt = "\n".join(message["content"] for message in messages)
+                if "请快速总结" in prompt and "第 2/3 个分块" in prompt:
+                    return ""
+                if "整理为一份快速总结" in prompt:
+                    return "## 总览\n- 最终整理完成\n\n## 重点话题\n- 测试话题"
+                return "- **分块话题**：发送者讨论了本块内容 [#1]"
+
+        messages = [
+            Message(str(index), "1", f"u{index % 3}", f"user {index % 3}", f"message {index}", 100 + index)
+            for index in range(501)
+        ]
+        blocks = []
+        progress_events = []
+
+        with patch("builtins.print"):
+            summary = EmptyChunkClient().summarize_fast(
+                "test group",
+                messages,
+                chunk_callback=lambda index, block: blocks.append((index, block)),
+                progress_callback=lambda *event: progress_events.append(event),
+            )
+
+        blocks_by_index = dict(blocks)
+        self.assertEqual(len(blocks), 3)
+        self.assertIn("本地原文摘录", blocks_by_index[2].content)
+        self.assertIn("最终整理完成", summary)
+        self.assertTrue(
+            any(
+                event[0] == "summarizing"
+                and event[1] == "warning"
+                and "本地原文摘录继续" in event[2]
+                for event in progress_events
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
