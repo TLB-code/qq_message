@@ -845,6 +845,8 @@ class AppTests(unittest.TestCase):
         self.assertIn('"items"', prompt[-1]["content"])
         self.assertIn("重点成员本人", prompt[-1]["content"])
         self.assertIn("魔女公主♪", prompt[-1]["content"])
+        self.assertNotIn("当前昵称", prompt[-1]["content"])
+        self.assertNotIn("[成员001]", prompt[-1]["content"])
 
     def test_summary_limit_is_one_batch(self):
         self.assertEqual(DEFAULT_SUMMARY_LIMIT, 5000)
@@ -1103,7 +1105,8 @@ class AppTests(unittest.TestCase):
         self.assertEqual(prepared[0].sender_alias, "重点成员")
         self.assertFalse(prepared[1].is_special_sender)
         self.assertEqual(prepared[1].sender_alias, prepared[2].sender_alias)
-        self.assertIn("@重点成员（魔女公主♪）", prepared[2].content)
+        self.assertIn("@重点成员", prepared[2].content)
+        self.assertNotIn("魔女公主♪）", prepared[2].content)
         self.assertIn("@某成员", prepared[2].content)
         self.assertNotIn("2829556413", prepared[2].content)
         self.assertNotIn("123456789", prepared[2].content)
@@ -1310,7 +1313,7 @@ class AppTests(unittest.TestCase):
 
         self.assertEqual(parsed["items"][0]["action_state"], "open")
 
-    def test_claim_cannot_reference_unrelated_member_alias(self):
+    def test_generated_member_alias_is_neutralized(self):
         messages = prepare_messages(
             [
                 Message(str(index), "1", f"u{index}", f"用户{index}", "消息", 100 + index)
@@ -1332,8 +1335,53 @@ class AppTests(unittest.TestCase):
             ]
         }
 
-        with self.assertRaisesRegex(SummarizerError, "Claim aliases"):
-            DeepSeekClient._validate_claim_aliases(payload, messages)
+        client = DeepSeekClient(api_key="test")
+        client._neutralize_generated_identities(payload, messages)
+
+        self.assertEqual(payload["items"][0]["claims"][0]["text"], "发送者作出说明")
+        self.assertNotIn("成员009", payload["items"][0]["claims"][0]["text"])
+
+    def test_wrong_generated_alias_does_not_fail_summary(self):
+        class WrongAliasClient(DeepSeekClient):
+            def __init__(self):
+                super().__init__(api_key="test")
+
+            def _chat(self, messages):
+                return json.dumps(
+                    {
+                        "items": [
+                            {
+                                "title": "成员003的发言",
+                                "type": "self_report",
+                                "action_state": "none",
+                                "attention_reason": "none",
+                                "claims": [
+                                    {"text": "成员003表示自己准备休息", "evidence": [14]}
+                                ],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+
+        messages = prepare_messages(
+            [
+                Message(str(index), "1", f"u{index}", f"用户{index}", "消息", 100 + index)
+                for index in range(1, 15)
+            ],
+            None,
+        )
+        client = WrongAliasClient()
+
+        payload = client._chat_structured(
+            [{"role": "user", "content": "总结"}],
+            messages,
+        )
+        summary = render_summary(payload, messages, messages, 1, "魔女公主♪")
+
+        self.assertNotIn("成员003", summary)
+        self.assertIn("参与者：用户14", summary)
+        self.assertIn("用户14：发送者表示自己准备休息", summary)
 
     def test_render_summary_derives_participants_and_ranks_overview(self):
         messages = prepare_messages(

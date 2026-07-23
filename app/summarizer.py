@@ -24,7 +24,7 @@ SUMMARY_RETRY_MAX_ITEMS = 20
 SUMMARY_RETRY_MAX_CLAIMS_PER_ITEM = 2
 REVIEW_BATCH_MAX_ITEMS = 10
 CHUNK_PARALLELISM = 4
-SUMMARY_PIPELINE_VERSION = 4
+SUMMARY_PIPELINE_VERSION = 5
 DEFAULT_SPECIAL_MEMBER_NAME = "魔女公主♪"
 EVIDENCE_TYPES = {
     "confirmed_fact",
@@ -79,7 +79,6 @@ def _format_message_line(message: Message) -> str:
     content = message.content.replace("\r\n", "\n").replace("\r", "\n").strip()
     content = " / ".join(line.strip() for line in content.splitlines() if line.strip())
     position = f"#{message.position}" if message.position else "#?"
-    alias = message.sender_alias or "成员"
     relations = []
     if message.is_special_sender:
         relations.append("重点成员本人")
@@ -88,10 +87,7 @@ def _format_message_line(message: Message) -> str:
     if message.replies_to_special:
         relations.append("回复重点成员")
     relation_text = f"[{'/'.join(relations)}]" if relations else ""
-    return (
-        f"[{position}][{_format_time(message.timestamp)}]"
-        f"[{alias}][当前昵称：{message.sender_name}]{relation_text} {content}"
-    )
+    return f"[{position}][{_format_time(message.timestamp)}][发送者]{relation_text} {content}"
 
 
 def prepare_messages(messages: list[Message], special_user_id: str | None) -> list[Message]:
@@ -104,7 +100,7 @@ def prepare_messages(messages: list[Message], special_user_id: str | None) -> li
     def mention_alias(user_id: str) -> str:
         if special_user_id and user_id == special_user_id:
             return "重点成员"
-        return aliases.get(user_id, "某成员")
+        return "某成员"
 
     prepared = []
     for index, message in enumerate(messages, start=1):
@@ -113,7 +109,7 @@ def prepare_messages(messages: list[Message], special_user_id: str | None) -> li
         else:
             alias = aliases[message.user_id]
         content = NAMED_QQ_MENTION_PATTERN.sub(
-            lambda match: f"@{mention_alias(match.group(2))}（{match.group(1)}）",
+            lambda match: f"@{mention_alias(match.group(2))}",
             message.content,
         )
         content = QQ_MENTION_PATTERN.sub(
@@ -269,8 +265,8 @@ def build_chunk_summary_prompt(
 - type=banter 时 action_state 和 attention_reason 必须都是 none。
 - 不得自行写“没人回应”“尚未解决”“需要支援”“存在风险”“需要进一步讨论”。
 - 昵称可能是角色扮演，不得映射到现实同名人物；不得改变原词含义，例如“黄油”不能写成“黄图”。
-- “成员009”是系统别名，与昵称文字“009”完全不同；涉及成员时只能使用消息行方括号中的成员别名。
-- 不要输出 participants，参与者由程序根据每条 claim 的证据发送者生成。
+- title 和 claim 中禁止输出“成员001”“重点成员”等系统别名、QQ 昵称、QQ 号或参与者名单；涉及身份时只能写“发送者”“对方”“群友”。
+- 不要输出 participants，参与者和每条 claim 的真实发送者由程序根据 evidence 对应消息的 QQ user_id 生成。
 - 最多输出 {SUMMARY_MAX_ITEMS} 个事件，每个事件最多 {SUMMARY_MAX_CLAIMS_PER_ITEM} 条 claim；优先保留主要事件、明确计划、明确担忧和重点成员相关事件。
 - 每条 claim 必须只引用直接支持自身文字的 1-5 条消息，不要加入仅仅时间相近的其他话题。
 - 看不到图片、转发和文件的实际内容，只能写群友文字中明确表达的信息。
@@ -325,6 +321,7 @@ def build_merge_summary_prompt(
 - banter 不能改成行动、关注、纠纷或风险。
 - action_state、attention_reason 只能沿用输入已有状态或降级为 none，不得自行升级。
 - 不要输出参与者、状态描述、总览或 Markdown。
+- title 和 claim 中禁止添加成员编号、QQ 昵称、QQ 号或参与者名单；只能保留输入中已有的中性称呼。
 - 重点成员身份只能由原事件的证据标记继承，不得根据昵称识别。“{special_member_name}”仅为显示名。
 - 最多输出 {SUMMARY_MAX_ITEMS} 个事件，每个事件最多 {SUMMARY_MAX_CLAIMS_PER_ITEM} 条 claim；优先合并重复内容，不要为同一话题创建多个近似事件。
 - 每个 claim 保留 1-5 个最直接证据；删除重复事件，但不要漏掉跨多个分块持续发生的主要事件。
@@ -369,13 +366,13 @@ def build_review_summary_prompt(
 
 复核规则：
 - 每条 claim 的每个关键结论必须能从它自己的 evidence 原文直接读出。
-- 昵称“009”不能解释成系统别名“成员009”；只能相信消息行方括号中的发送者别名。
+- title 和 claim 中禁止输出成员编号、QQ 昵称、QQ 号或参与者名单；使用“发送者”“对方”“群友”等中性称呼。
 - 不得把“赌狗”归给没有说这个词的人，不得把“太成熟/太老”改写成“要求换图”。
 - 游戏互怼、“杂鱼”“可恶”“退出某社”等语境默认是 banter，除非原文明示真实求助或担忧。
 - “需要回应、未解决、需要支援、存在风险”必须有原文直接依据，否则 attention_reason=none 并删除相关措辞。
 - 已经在证据中得到回答的问题不能是 open 行动。
 - 不得增加候选 evidence 之外的位置。允许删除无关证据、删除主张、拆分混杂事件或删除整个事件。
-- 不要输出 participants、Markdown 或解释。
+- 不要输出 participants、Markdown 或解释；参与者身份由程序根据 evidence 补全。
 
 候选事件：
 {summary_json_text(payload)}
@@ -598,6 +595,18 @@ def _item_participants(
     return aliases[:12]
 
 
+def _claim_participants(
+    claim: dict[str, Any],
+    messages_by_position: dict[int, Message],
+) -> list[str]:
+    aliases = []
+    for position in claim["evidence"]:
+        message = messages_by_position.get(position)
+        if message and message.sender_alias and message.sender_alias not in aliases:
+            aliases.append(message.sender_alias)
+    return aliases[:6]
+
+
 def _merge_duplicate_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
     for item in items:
@@ -701,6 +710,12 @@ def _render_items(
         claims = []
         for claim in item["claims"]:
             claim_text = _replace_aliases(claim["text"], display_names)
+            claim_aliases = _claim_participants(claim, messages_by_position)
+            if claim_aliases:
+                claim_speakers = "、".join(
+                    display_names.get(alias, alias) for alias in claim_aliases
+                )
+                claim_text = f"{claim_speakers}：{claim_text}"
             evidence = _evidence_label(claim["evidence"], messages_by_position)
             claims.append(claim_text + (f" [证据：{evidence}]" if evidence else ""))
         title = _replace_aliases(item["title"], display_names)
@@ -1223,35 +1238,31 @@ class DeepSeekClient:
                 special_positions.update(int(position) for position in item.get("special_evidence", []))
         return types_by_position, actions_by_position, attention_by_position, special_positions
 
-    @staticmethod
-    def _validate_claim_aliases(
+    def _neutralize_generated_identities(
+        self,
         payload: dict[str, list[dict[str, Any]]],
         messages: list[Message],
     ) -> None:
         messages_by_position = {message.position: message for message in messages}
         for item in payload["items"]:
-            item_aliases = set(MEMBER_ALIAS_PATTERN.findall(item["title"]))
-            item_allowed_aliases = set()
-            for position in item["evidence"]:
-                message = messages_by_position.get(position)
-                if message is None:
-                    continue
-                if message.sender_alias:
-                    item_allowed_aliases.add(message.sender_alias)
-                item_allowed_aliases.update(MEMBER_ALIAS_PATTERN.findall(message.content))
-            if not item_aliases.issubset(item_allowed_aliases):
-                unsupported = sorted(item_aliases - item_allowed_aliases)
-                raise SummarizerError(
-                    "Title aliases "
-                    f"{unsupported} are outside event evidence aliases {sorted(item_allowed_aliases)}"
+            item["title"] = MEMBER_ALIAS_PATTERN.sub("群友", item["title"])
+            if self.special_member_display_name:
+                item["title"] = item["title"].replace(
+                    self.special_member_display_name,
+                    "群友",
                 )
             for claim in item["claims"]:
-                referenced_aliases = set(MEMBER_ALIAS_PATTERN.findall(claim["text"]))
-                if not referenced_aliases.issubset(item_allowed_aliases):
-                    unsupported = sorted(referenced_aliases - item_allowed_aliases)
-                    raise SummarizerError(
-                        "Claim aliases "
-                        f"{unsupported} are outside event evidence aliases {sorted(item_allowed_aliases)}"
+                sender_ids = {
+                    messages_by_position[position].user_id
+                    for position in claim["evidence"]
+                    if position in messages_by_position
+                }
+                neutral_identity = "发送者" if len(sender_ids) == 1 else "相关成员"
+                claim["text"] = MEMBER_ALIAS_PATTERN.sub(neutral_identity, claim["text"])
+                if self.special_member_display_name:
+                    claim["text"] = claim["text"].replace(
+                        self.special_member_display_name,
+                        neutral_identity,
                     )
 
     def _chat_structured(
@@ -1278,7 +1289,7 @@ class DeepSeekClient:
             raw = self._chat(prompt)
             try:
                 payload = parse_summary_json(raw, allowed_positions, special_positions)
-                self._validate_claim_aliases(payload, source_messages)
+                self._neutralize_generated_identities(payload, source_messages)
                 if source_types:
                     for item in payload["items"]:
                         if any(
