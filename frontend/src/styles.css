@@ -481,6 +481,23 @@ button:disabled {
   color: #ffffff;
 }
 
+.summary-mode-toggle {
+  min-width: 112px;
+}
+
+.summary-mode-toggle.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-weight: 800;
+}
+
+.summary-mode-toggle.forced {
+  border-color: var(--line);
+  background: var(--surface-subtle);
+  color: var(--muted);
+}
+
 .auto-summary-toggle.active {
   border-color: var(--accent);
   background: var(--accent-soft);

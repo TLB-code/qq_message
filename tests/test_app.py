@@ -25,6 +25,7 @@ from app.server import (
     media_proxy_url,
     message_payload_from_record,
     parse_manual_summary_limit,
+    parse_manual_summary_mode,
     process_manual_summary_task,
     query_bool,
     revoke_web_session,
@@ -391,8 +392,16 @@ class AppTests(unittest.TestCase):
             def summarize_fast(self, *args, **kwargs):
                 return self._complete("fast", kwargs)
 
-        for message_count, expected_mode in ((1000, "detailed"), (1001, "fast")):
-            with self.subTest(message_count=message_count), TemporaryDirectory() as tmp:
+        cases = (
+            (1000, "detailed", "detailed"),
+            (1000, "fast", "fast"),
+            (1001, "detailed", "fast"),
+        )
+        for message_count, requested_mode, expected_mode in cases:
+            with self.subTest(
+                message_count=message_count,
+                requested_mode=requested_mode,
+            ), TemporaryDirectory() as tmp:
                 original_store = server.STORE
                 original_summarizer = server.SUMMARIZER
                 store = Store(Path(tmp) / "test.sqlite3")
@@ -403,7 +412,14 @@ class AppTests(unittest.TestCase):
                         Message(str(index), "1", "u1", "user", f"message {index}", 100 + index),
                         {"message_id": index},
                     )
-                store.create_summary_task("task-1", "1", 5000, True, 2000)
+                store.create_summary_task(
+                    "task-1",
+                    "1",
+                    5000,
+                    True,
+                    2000,
+                    mode=requested_mode,
+                )
                 fake = ModeFakeSummarizer()
 
                 try:
@@ -977,6 +993,14 @@ class AppTests(unittest.TestCase):
             parse_manual_summary_limit(5001)
         with self.assertRaises(ValueError):
             parse_manual_summary_limit("1.5")
+
+    def test_manual_summary_mode_defaults_and_validates(self):
+        self.assertEqual(parse_manual_summary_mode(None), "detailed")
+        self.assertEqual(parse_manual_summary_mode(""), "detailed")
+        self.assertEqual(parse_manual_summary_mode("detailed"), "detailed")
+        self.assertEqual(parse_manual_summary_mode("FAST"), "fast")
+        with self.assertRaises(ValueError):
+            parse_manual_summary_mode("automatic")
 
     def test_split_messages_preserves_order(self):
         messages = [

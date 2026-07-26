@@ -565,7 +565,10 @@ class Store:
         mark_read: bool,
         created_at: int,
         pipeline_version: int = 2,
+        mode: str = "detailed",
     ) -> tuple[dict[str, Any], bool]:
+        if mode not in {"detailed", "fast"}:
+            raise ValueError("Unsupported summary task mode")
         with self.connect() as conn:
             existing = conn.execute(
                 """
@@ -584,14 +587,15 @@ class Store:
                     """
                     INSERT INTO summary_tasks (
                         task_id, group_id, requested_limit, mark_read, status, stage,
-                        created_at, pipeline_version
-                    ) VALUES (?, ?, ?, ?, 'queued', 'queued', ?, ?)
+                        mode, created_at, pipeline_version
+                    ) VALUES (?, ?, ?, ?, 'queued', 'queued', ?, ?, ?)
                     """,
                     (
                         task_id,
                         group_id,
                         requested_limit,
                         int(mark_read),
+                        mode,
                         created_at,
                         pipeline_version,
                     ),

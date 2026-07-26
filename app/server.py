@@ -220,6 +220,15 @@ def parse_manual_summary_limit(value: object) -> int:
     return limit
 
 
+def parse_manual_summary_mode(value: object) -> str:
+    if value is None or value == "":
+        return "detailed"
+    mode = str(value).strip().lower()
+    if mode not in {"detailed", "fast"}:
+        raise ValueError("Summary mode must be detailed or fast")
+    return mode
+
+
 def summary_task_payload(task: dict, events: list[dict] | None = None) -> dict:
     return {
         "task_id": str(task["task_id"]),
@@ -448,8 +457,9 @@ def process_manual_summary_task(task_id: str) -> dict | None:
             if len(records) != expected_records:
                 raise ValueError("Some messages in the summary task snapshot are no longer available")
 
+            requested_mode = str(refreshed_task.get("mode") or "detailed")
             summary_mode = (
-                "detailed"
+                requested_mode
                 if len(records) <= DETAILED_SUMMARY_MAX_MESSAGES
                 else "fast"
             )
@@ -1187,6 +1197,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         body = self._read_json(default={})
         try:
             limit = parse_manual_summary_limit(body.get("limit"))
+            mode = parse_manual_summary_mode(body.get("mode"))
         except ValueError as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
@@ -1206,6 +1217,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             mark_read=mark_read,
             created_at=int(time.time()),
             pipeline_version=SUMMARY_PIPELINE_VERSION,
+            mode=mode,
         )
         if created:
             STORE.add_summary_task_event(

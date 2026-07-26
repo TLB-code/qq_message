@@ -76,6 +76,21 @@
             />
             <span>条</span>
           </label>
+          <button
+            class="summary-mode-toggle"
+            type="button"
+            :class="{
+              active: canChooseDetailedMode && preferDetailedSummary,
+              forced: !canChooseDetailedMode,
+            }"
+            :disabled="!canChooseDetailedMode || isMutating || isSummaryRunning"
+            :aria-pressed="canChooseDetailedMode && preferDetailedSummary"
+            :title="canChooseDetailedMode ? '切换手动总结模式' : '超过 1000 条时强制使用快速模式'"
+            @click="preferDetailedSummary = !preferDetailedSummary"
+          >
+            <ListChecks :size="17" />
+            <span>{{ manualSummaryModeButtonText }}</span>
+          </button>
           <button class="primary-button" type="button" :disabled="!canSummarize" @click="summarizeSelectedGroup">
             <Sparkles :size="17" />
             <span>总结未读</span>
@@ -309,6 +324,7 @@ import {
   GripVertical,
   Inbox,
   Info,
+  ListChecks,
   ScrollText,
   ShieldCheck,
   Sparkles,
@@ -355,6 +371,7 @@ const markingSummaryReadIds = ref([]);
 const isRefreshing = ref(false);
 const isMutating = ref(false);
 const summaryLimitInput = ref("");
+const preferDetailedSummary = ref(true);
 const summaryDetailsExpanded = ref(true);
 const unreadPanel = ref(null);
 const historyPanel = ref(null);
@@ -450,6 +467,25 @@ const selectedGroupStats = computed(() => {
   };
 });
 const unreadTotalCount = computed(() => selectedGroupStats.value.unreadCount ?? unread.totalCount);
+const expectedManualSummaryCount = computed(() => {
+  const rawLimit = String(summaryLimitInput.value ?? "").trim();
+  const parsedLimit = rawLimit === "" ? MANUAL_SUMMARY_MAX : Number(rawLimit);
+  const safeLimit = Number.isInteger(parsedLimit) && parsedLimit > 0
+    ? Math.min(parsedLimit, MANUAL_SUMMARY_MAX)
+    : MANUAL_SUMMARY_MAX;
+  return Math.min(safeLimit, Number(unreadTotalCount.value || 0));
+});
+const canChooseDetailedMode = computed(() => (
+  expectedManualSummaryCount.value > 0
+  && expectedManualSummaryCount.value <= 1000
+));
+const selectedManualSummaryMode = computed(() => (
+  canChooseDetailedMode.value && preferDetailedSummary.value ? "detailed" : "fast"
+));
+const manualSummaryModeButtonText = computed(() => {
+  if (!canChooseDetailedMode.value) return "仅快速模式";
+  return preferDetailedSummary.value ? "详细模式" : "快速模式";
+});
 const isSummaryRunning = computed(() => ["queued", "running"].includes(summaryTask.status));
 const summaryProgressPercent = computed(() => Math.min(
   Math.max(Number(summaryTask.progressPercent || 0), 0),
@@ -1002,10 +1038,12 @@ async function summarizeSelectedGroup() {
 
   isMutating.value = true;
   const expectedCount = Math.min(limit, unreadTotalCount.value);
-  setStatus(`正在创建 ${expectedCount} 条消息的后台总结任务...`);
+  const mode = selectedManualSummaryMode.value;
+  const modeLabel = mode === "detailed" ? "详细模式" : "快速模式";
+  setStatus(`正在创建 ${expectedCount} 条消息的${modeLabel}总结任务...`);
 
   try {
-    const result = await summarizeGroup(selectedGroupId.value, limit);
+    const result = await summarizeGroup(selectedGroupId.value, limit, mode);
     setSummaryTask(result.task);
     void monitorSummaryTask(result.task);
   } catch (error) {
