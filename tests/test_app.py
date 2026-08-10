@@ -1812,6 +1812,101 @@ class AppTests(unittest.TestCase):
         self.assertIn("empty=true", log_output)
         self.assertNotIn("sensitive chat prompt", log_output)
 
+    def test_deepseek_text_request_disables_thinking(self):
+        client = DeepSeekClient(api_key="test")
+        response_body = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {"content": "summary"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {},
+            }
+        ).encode("utf-8")
+
+        class FakeResponse:
+            status = 200
+            headers = {}
+
+            def read(self):
+                return response_body
+
+            def getcode(self):
+                return self.status
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        with (
+            patch("app.summarizer.urllib.request.urlopen", return_value=FakeResponse()) as urlopen,
+            patch("builtins.print") as print_mock,
+        ):
+            result = client._chat_text(
+                [{"role": "user", "content": "summarize"}],
+                max_tokens=64,
+            )
+
+        request = urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        log_output = "\n".join(
+            " ".join(str(argument) for argument in call.args)
+            for call in print_mock.call_args_list
+        )
+        self.assertEqual(result, "summary")
+        self.assertEqual(payload["thinking"], {"type": "disabled"})
+        self.assertIn("thinking=disabled", log_output)
+
+    def test_deepseek_structured_request_keeps_default_thinking_mode(self):
+        client = DeepSeekClient(api_key="test")
+        response_body = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {"content": '{"items": []}'},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {},
+            }
+        ).encode("utf-8")
+
+        class FakeResponse:
+            status = 200
+            headers = {}
+
+            def read(self):
+                return response_body
+
+            def getcode(self):
+                return self.status
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        with (
+            patch("app.summarizer.urllib.request.urlopen", return_value=FakeResponse()) as urlopen,
+            patch("builtins.print") as print_mock,
+        ):
+            result = client._chat([{"role": "user", "content": "summarize"}])
+
+        request = urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        log_output = "\n".join(
+            " ".join(str(argument) for argument in call.args)
+            for call in print_mock.call_args_list
+        )
+        self.assertEqual(result, '{"items": []}')
+        self.assertNotIn("thinking", payload)
+        self.assertIn("thinking=default", log_output)
+
     def test_render_summary_uses_program_computed_range_and_gap(self):
         messages = [
             Message("1", "1", "u1", "甲", "第一条", 100, position=1),

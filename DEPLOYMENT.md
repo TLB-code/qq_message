@@ -1323,6 +1323,7 @@ grep -E "DeepSeek (request|response)|Summary warning|Manual summary"
 
 日志不会输出聊天原文、提示词或 API Key。重点关注以下字段：
 
+- `thinking`：快速模式应为 `disabled`；详细模式为 `default`，由模型使用默认思考模式。
 - `queue_wait`：请求等待全局并发名额的时间。
 - `http_status`：DeepSeek 返回的 HTTP 状态。
 - `finish_reason`：模型结束生成的原因。

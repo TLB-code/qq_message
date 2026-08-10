@@ -2056,16 +2056,27 @@ class DeepSeekClient:
         raise SummarizerError(f"{operation}: Unable to validate DeepSeek summary JSON")
 
     def _chat(self, messages: list[dict[str, str]]) -> str:
-        return self._request_chat(messages, json_response=True, max_tokens=8192)
+        return self._request_chat(
+            messages,
+            json_response=True,
+            max_tokens=8192,
+            thinking_type=None,
+        )
 
     def _chat_text(self, messages: list[dict[str, str]], max_tokens: int) -> str:
-        return self._request_chat(messages, json_response=False, max_tokens=max_tokens)
+        return self._request_chat(
+            messages,
+            json_response=False,
+            max_tokens=max_tokens,
+            thinking_type="disabled",
+        )
 
     def _request_chat(
         self,
         messages: list[dict[str, str]],
         json_response: bool,
         max_tokens: int,
+        thinking_type: str | None,
     ) -> str:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -2076,6 +2087,8 @@ class DeepSeekClient:
         }
         if json_response:
             payload["response_format"] = {"type": "json_object"}
+        if thinking_type is not None:
+            payload["thinking"] = {"type": thinking_type}
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -2099,6 +2112,7 @@ class DeepSeekClient:
                 message_count=len(messages),
                 json_response=json_response,
                 max_tokens=max_tokens,
+                thinking_type=thinking_type,
                 queue_wait=queue_wait,
             )
         finally:
@@ -2112,6 +2126,7 @@ class DeepSeekClient:
         message_count: int,
         json_response: bool,
         max_tokens: int,
+        thinking_type: str | None,
         queue_wait: float,
     ) -> str:
         thread_name = threading.current_thread().name
@@ -2120,7 +2135,8 @@ class DeepSeekClient:
             "DeepSeek request started: "
             f"request={request_log_id} model={self.model} thread={thread_name} "
             f"format={response_format} messages={message_count} input_chars={input_chars} "
-            f"max_tokens={max_tokens} queue_wait={queue_wait:.3f}s "
+            f"max_tokens={max_tokens} thinking={thinking_type or 'default'} "
+            f"queue_wait={queue_wait:.3f}s "
             f"concurrency_limit={self.max_concurrency}",
             flush=True,
         )

@@ -261,8 +261,11 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 然后重新点击“总结未读”。
 
 后端控制台会输出 `DeepSeek request started` 和 `DeepSeek response` 日志。重点查看
-`queue_wait`、`finish_reason`、`content_chars`、`reasoning_chars`、Token 用量和
+`thinking`、`queue_wait`、`finish_reason`、`content_chars`、`reasoning_chars`、Token 用量和
 `empty` 字段；这些日志不会输出聊天原文、提示词或 API Key。
+
+快速模式的请求应显示 `thinking=disabled`，避免推理内容耗尽输出 Token；详细模式会
+显示 `thinking=default`，继续使用模型默认的思考模式。
 
 ### 需要查看原始 webhook 数据
 
