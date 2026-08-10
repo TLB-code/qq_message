@@ -1672,6 +1672,146 @@ class AppTests(unittest.TestCase):
 
         self.assertEqual(urlopen.call_count, 3)
 
+    def test_deepseek_client_limits_concurrent_api_requests(self):
+        client = DeepSeekClient(api_key="test", max_concurrency=2)
+        release_requests = threading.Event()
+        two_requests_started = threading.Event()
+        active_lock = threading.Lock()
+        active_requests = 0
+        max_active_requests = 0
+        errors = []
+
+        response_body = json.dumps(
+            {
+                "id": "response-1",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "message": {"content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {},
+            }
+        ).encode("utf-8")
+
+        class FakeResponse:
+            status = 200
+            headers = {}
+
+            def read(self):
+                return response_body
+
+            def getcode(self):
+                return self.status
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                nonlocal active_requests
+                with active_lock:
+                    active_requests -= 1
+
+        def fake_urlopen(*_args, **_kwargs):
+            nonlocal active_requests, max_active_requests
+            with active_lock:
+                active_requests += 1
+                max_active_requests = max(max_active_requests, active_requests)
+                if active_requests == 2:
+                    two_requests_started.set()
+            release_requests.wait(timeout=3)
+            return FakeResponse()
+
+        def run_request():
+            try:
+                client._chat_text([{"role": "user", "content": "test"}], max_tokens=32)
+            except Exception as exc:  # pragma: no cover - assertion reports thread errors
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run_request) for _ in range(4)]
+        with (
+            patch("app.summarizer.urllib.request.urlopen", side_effect=fake_urlopen),
+            patch("builtins.print"),
+        ):
+            for thread in threads:
+                thread.start()
+            self.assertTrue(two_requests_started.wait(timeout=1))
+            time.sleep(0.05)
+            self.assertEqual(max_active_requests, 2)
+            release_requests.set()
+            for thread in threads:
+                thread.join(timeout=2)
+
+        self.assertFalse(errors)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(max_active_requests, 2)
+
+    def test_deepseek_client_logs_empty_response_metadata_without_prompt(self):
+        client = DeepSeekClient(api_key="test", max_concurrency=2)
+        response_body = json.dumps(
+            {
+                "id": "response-empty-1",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "reasoning_content": "internal reasoning",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 123,
+                    "completion_tokens": 45,
+                    "total_tokens": 168,
+                },
+            }
+        ).encode("utf-8")
+
+        class FakeResponse:
+            status = 200
+            headers = {"x-request-id": "header-request-1"}
+
+            def read(self):
+                return response_body
+
+            def getcode(self):
+                return self.status
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        with (
+            patch("app.summarizer.urllib.request.urlopen", return_value=FakeResponse()),
+            patch("builtins.print") as print_mock,
+        ):
+            result = client._chat_text(
+                [{"role": "user", "content": "sensitive chat prompt"}],
+                max_tokens=64,
+            )
+
+        log_output = "\n".join(
+            " ".join(str(argument) for argument in call.args)
+            for call in print_mock.call_args_list
+        )
+        self.assertEqual(result, "")
+        self.assertIn("DeepSeek response:", log_output)
+        self.assertIn("response_id=response-empty-1", log_output)
+        self.assertIn("header_request_id=header-request-1", log_output)
+        self.assertIn("finish_reason=stop", log_output)
+        self.assertIn("content_chars=0", log_output)
+        self.assertIn("reasoning_chars=18", log_output)
+        self.assertIn("prompt_tokens=123", log_output)
+        self.assertIn("completion_tokens=45", log_output)
+        self.assertIn("total_tokens=168", log_output)
+        self.assertIn("empty=true", log_output)
+        self.assertNotIn("sensitive chat prompt", log_output)
+
     def test_render_summary_uses_program_computed_range_and_gap(self):
         messages = [
             Message("1", "1", "u1", "甲", "第一条", 100, position=1),

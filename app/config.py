@@ -32,6 +32,7 @@ class Settings:
     deepseek_model: str
     deepseek_timeout: int
     deepseek_request_retries: int
+    deepseek_max_concurrency: int
     host: str
     port: int
     webhook_debug: bool
@@ -69,6 +70,7 @@ def load_settings() -> Settings:
         deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
         deepseek_timeout=max(env_int("DEEPSEEK_TIMEOUT", 180), 30),
         deepseek_request_retries=max(env_int("DEEPSEEK_REQUEST_RETRIES", 2), 0),
+        deepseek_max_concurrency=max(min(env_int("DEEPSEEK_MAX_CONCURRENCY", 2), 16), 1),
         host=os.getenv("QQ_SUMMARY_HOST", "127.0.0.1"),
         port=env_int("QQ_SUMMARY_PORT", 8000),
         webhook_debug=env_bool("QQ_SUMMARY_WEBHOOK_DEBUG"),

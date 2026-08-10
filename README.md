@@ -28,6 +28,7 @@ Copy `.env.example` to `.env` or set environment variables directly:
 $env:DEEPSEEK_API_KEY="sk-your-deepseek-api-key"
 $env:DEEPSEEK_MODEL="deepseek-v4-flash"
 $env:DEEPSEEK_BASE_URL="https://api.deepseek.com"
+$env:DEEPSEEK_MAX_CONCURRENCY="2"
 $env:QQ_SUMMARY_WEBHOOK_TOKEN="use-a-long-random-token"
 $env:QQ_SUMMARY_WEB_PASSWORD="use-a-strong-page-password"
 $env:QQ_SUMMARY_AUTO_SUMMARY_ENABLED="true"

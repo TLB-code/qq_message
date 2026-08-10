@@ -43,6 +43,7 @@ SUMMARIZER = DeepSeekClient(
     model=SETTINGS.deepseek_model,
     timeout=SETTINGS.deepseek_timeout,
     request_retries=SETTINGS.deepseek_request_retries,
+    max_concurrency=SETTINGS.deepseek_max_concurrency,
     special_member_user_id=SETTINGS.special_member_user_id,
     special_member_display_name=SETTINGS.special_member_display_name,
 )
@@ -1377,6 +1378,7 @@ def run() -> None:
     print(f"QQ Message Summary running at http://{SETTINGS.host}:{SETTINGS.port}")
     print(f"SQLite database: {SETTINGS.database_path}")
     print(f"DeepSeek model: {SETTINGS.deepseek_model}")
+    print(f"DeepSeek max concurrency: {SETTINGS.deepseek_max_concurrency}")
     print(
         "Auto summary: "
         f"{'enabled' if SETTINGS.auto_summary_enabled else 'disabled'} "

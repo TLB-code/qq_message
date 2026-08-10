@@ -993,6 +993,7 @@ class DeepSeekClient:
         chunk_parallelism: int = CHUNK_PARALLELISM,
         special_member_user_id: str | None = None,
         special_member_display_name: str = DEFAULT_SPECIAL_MEMBER_NAME,
+        max_concurrency: int = 2,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -1007,7 +1008,16 @@ class DeepSeekClient:
         self.chunk_parallelism = max(int(chunk_parallelism), 1)
         self.special_member_user_id = special_member_user_id
         self.special_member_display_name = special_member_display_name
+        self.max_concurrency = max(int(max_concurrency), 1)
+        self._request_slots = threading.BoundedSemaphore(self.max_concurrency)
+        self._request_counter = 0
+        self._request_counter_lock = threading.Lock()
         self._chat_state = threading.local()
+
+    def _next_request_log_id(self) -> str:
+        with self._request_counter_lock:
+            self._request_counter += 1
+            return f"ds-{self._request_counter:06d}"
 
     def summarize(
         self,
@@ -2076,45 +2086,164 @@ class DeepSeekClient:
             method="POST",
         )
 
-        started_at = time.time()
+        request_log_id = self._next_request_log_id()
+        input_chars = sum(len(str(message.get("content") or "")) for message in messages)
+        queued_at = time.monotonic()
+        self._request_slots.acquire()
+        queue_wait = time.monotonic() - queued_at
+        try:
+            return self._request_chat_with_slot(
+                request=request,
+                request_log_id=request_log_id,
+                input_chars=input_chars,
+                message_count=len(messages),
+                json_response=json_response,
+                max_tokens=max_tokens,
+                queue_wait=queue_wait,
+            )
+        finally:
+            self._request_slots.release()
+
+    def _request_chat_with_slot(
+        self,
+        request: urllib.request.Request,
+        request_log_id: str,
+        input_chars: int,
+        message_count: int,
+        json_response: bool,
+        max_tokens: int,
+        queue_wait: float,
+    ) -> str:
+        thread_name = threading.current_thread().name
+        response_format = "json" if json_response else "text"
+        print(
+            "DeepSeek request started: "
+            f"request={request_log_id} model={self.model} thread={thread_name} "
+            f"format={response_format} messages={message_count} input_chars={input_chars} "
+            f"max_tokens={max_tokens} queue_wait={queue_wait:.3f}s "
+            f"concurrency_limit={self.max_concurrency}",
+            flush=True,
+        )
+
+        started_at = time.monotonic()
         attempts = self.request_retries + 1
         body = ""
         last_error: Exception | None = None
+        http_status: int | str = "unknown"
+        response_headers: Any = None
         for attempt in range(attempts):
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    http_status = getattr(response, "status", None) or response.getcode()
+                    response_headers = getattr(response, "headers", None)
                     body = response.read().decode("utf-8")
                 break
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
                 if exc.code not in {429, 500, 502, 503, 504} or attempt >= attempts - 1:
+                    elapsed = time.monotonic() - started_at
+                    print(
+                        "DeepSeek request failed: "
+                        f"request={request_log_id} model={self.model} thread={thread_name} "
+                        f"attempt={attempt + 1}/{attempts} elapsed={elapsed:.3f}s "
+                        f"reason=http_{exc.code} detail_chars={len(detail)}",
+                        flush=True,
+                    )
                     raise SummarizerError(f"DeepSeek API returned HTTP {exc.code}: {detail}") from exc
                 last_error = exc
+                print(
+                    "DeepSeek request retry: "
+                    f"request={request_log_id} model={self.model} thread={thread_name} "
+                    f"attempt={attempt + 1}/{attempts} reason=http_{exc.code}",
+                    flush=True,
+                )
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 if attempt >= attempts - 1:
-                    elapsed = time.time() - started_at
+                    elapsed = time.monotonic() - started_at
+                    reason = "timeout" if isinstance(exc, TimeoutError) or "timed out" in str(exc).lower() else type(exc).__name__
+                    print(
+                        "DeepSeek request failed: "
+                        f"request={request_log_id} model={self.model} thread={thread_name} "
+                        f"attempt={attempt + 1}/{attempts} elapsed={elapsed:.3f}s "
+                        f"reason={reason}",
+                        flush=True,
+                    )
                     if isinstance(exc, TimeoutError) or "timed out" in str(exc).lower():
                         raise SummarizerError(
                             f"DeepSeek API read timed out after {attempts} attempts ({elapsed:.1f}s)"
                         ) from exc
                     raise SummarizerError(f"DeepSeek API request failed after {attempts} attempts: {exc}") from exc
                 last_error = exc
+                print(
+                    "DeepSeek request retry: "
+                    f"request={request_log_id} model={self.model} thread={thread_name} "
+                    f"attempt={attempt + 1}/{attempts} reason={type(exc).__name__}",
+                    flush=True,
+                )
             time.sleep(min(2 ** attempt, 5))
         if not body:
+            elapsed = time.monotonic() - started_at
+            print(
+                "DeepSeek request failed: "
+                f"request={request_log_id} model={self.model} thread={thread_name} "
+                f"elapsed={elapsed:.3f}s reason=empty_http_body",
+                flush=True,
+            )
             raise SummarizerError(f"DeepSeek API request failed: {last_error}") from last_error
 
         try:
             data = json.loads(body)
             choice = data["choices"][0]
-            content = choice["message"]["content"]
+            response_message = choice["message"]
+            if not isinstance(response_message, dict):
+                raise TypeError("DeepSeek response message must be an object")
+            content = response_message.get("content")
         except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-            elapsed = time.time() - started_at
+            elapsed = time.monotonic() - started_at
+            print(
+                "DeepSeek request failed: "
+                f"request={request_log_id} model={self.model} thread={thread_name} "
+                f"http_status={http_status} elapsed={elapsed:.3f}s "
+                f"reason=unexpected_response body_chars={len(body)}",
+                flush=True,
+            )
             raise SummarizerError(f"Unexpected DeepSeek API response after {elapsed:.1f}s") from exc
 
-        content_text = str(content)
+        content_text = content if isinstance(content, str) else ""
+        cleaned_content = strip_markdown_noise(content_text)
+        reasoning_content = response_message.get("reasoning_content")
+        reasoning_chars = len(reasoning_content) if isinstance(reasoning_content, str) else 0
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        finish_reason = str(choice.get("finish_reason") or "unknown")
+        response_id = str(data.get("id") or "-")
+        response_model = str(data.get("model") or self.model)
+        header_request_id = "-"
+        if response_headers is not None:
+            for header_name in ("x-request-id", "x-ds-request-id", "request-id", "cf-ray"):
+                header_value = response_headers.get(header_name)
+                if header_value:
+                    header_request_id = str(header_value)
+                    break
+        elapsed = time.monotonic() - started_at
+        print(
+            "DeepSeek response: "
+            f"request={request_log_id} response_id={response_id} "
+            f"header_request_id={header_request_id} model={self.model} "
+            f"response_model={response_model} thread={thread_name} http_status={http_status} "
+            f"attempts_used={attempt + 1}/{attempts} elapsed={elapsed:.3f}s "
+            f"queue_wait={queue_wait:.3f}s finish_reason={finish_reason} "
+            f"content_chars={len(cleaned_content)} raw_content_chars={len(content_text)} "
+            f"reasoning_chars={reasoning_chars} prompt_tokens={usage.get('prompt_tokens', '-')} "
+            f"completion_tokens={usage.get('completion_tokens', '-')} "
+            f"total_tokens={usage.get('total_tokens', '-')} empty={str(not cleaned_content).lower()}",
+            flush=True,
+        )
         self._chat_state.metadata = {
-            "finish_reason": str(choice.get("finish_reason") or "unknown"),
-            "response_chars": len(content_text),
+            "finish_reason": finish_reason,
+            "response_chars": len(cleaned_content),
             "response_tail": content_text[-300:],
+            "reasoning_chars": reasoning_chars,
+            "response_id": response_id,
+            "header_request_id": header_request_id,
         }
-        return strip_markdown_noise(content_text)
+        return cleaned_content

@@ -274,6 +274,9 @@ nano .env
 DEEPSEEK_API_KEY=你的DeepSeek_API_Key
 DEEPSEEK_MODEL=deepseek-v4-flash
 DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_TIMEOUT=180
+DEEPSEEK_REQUEST_RETRIES=2
+DEEPSEEK_MAX_CONCURRENCY=2
 
 QQ_SUMMARY_HOST=127.0.0.1
 QQ_SUMMARY_PORT=8000
@@ -302,6 +305,9 @@ chmod 600 /opt/qq_message/.env
 | `DEEPSEEK_API_KEY` | 必填 | DeepSeek API Key，用来调用 AI 总结。没有这个值，服务可以启动，但总结会失败。 |
 | `DEEPSEEK_MODEL` | 建议填写 | DeepSeek 模型名。当前项目默认使用 `deepseek-v4-flash`。 |
 | `DEEPSEEK_BASE_URL` | 建议填写 | DeepSeek API 地址，官方地址通常是 `https://api.deepseek.com`。 |
+| `DEEPSEEK_TIMEOUT` | 默认 `180` | 单次 DeepSeek 请求的读取超时秒数。空响应不是超时，单纯增大这个值不能解决空响应。 |
+| `DEEPSEEK_REQUEST_RETRIES` | 默认 `2` | 对超时、限流和临时服务错误进行自动重试。 |
+| `DEEPSEEK_MAX_CONCURRENCY` | 建议 `2` | 后端进程内 DeepSeek 请求的全局并发上限，手动与自动总结共用。 |
 | `QQ_SUMMARY_HOST` | 服务器部署建议 `127.0.0.1` | 后端只监听本机，由 Nginx 对外代理，更安全。 |
 | `QQ_SUMMARY_PORT` | 默认 `8000` | 后端监听端口。 |
 | `QQ_SUMMARY_DB` | 默认 `data/qq_summary.sqlite3` | SQLite 数据库路径，消息和总结历史都保存在这里。 |
@@ -1297,6 +1303,33 @@ python -c "from app.config import load_settings; s=load_settings(); print(bool(s
 ```
 
 如果第一个输出是 `False`，说明 `DEEPSEEK_API_KEY` 没有加载成功。
+
+查看 DeepSeek 请求和响应元数据：
+
+```bash
+sudo journalctl -u qq-message -f -o cat |
+grep --line-buffered -E "DeepSeek (request|response)|Summary warning|Manual summary"
+```
+
+查询指定时间段：
+
+```bash
+sudo journalctl -u qq-message \
+  --since "2026-08-10 11:30:00" \
+  --until "2026-08-10 12:00:00" \
+  -o cat --no-pager |
+grep -E "DeepSeek (request|response)|Summary warning|Manual summary"
+```
+
+日志不会输出聊天原文、提示词或 API Key。重点关注以下字段：
+
+- `queue_wait`：请求等待全局并发名额的时间。
+- `http_status`：DeepSeek 返回的 HTTP 状态。
+- `finish_reason`：模型结束生成的原因。
+- `content_chars`、`reasoning_chars`：最终内容和推理内容长度。
+- `prompt_tokens`、`completion_tokens`、`total_tokens`：本次 Token 用量。
+- `empty=true`：HTTP 响应可解析，但最终 `content` 为空。
+- `response_id`、`header_request_id`：用于向 DeepSeek 侧定位请求。
 
 ### Nginx 502
 
