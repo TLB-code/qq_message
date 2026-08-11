@@ -42,6 +42,12 @@ class Settings:
     auto_summary_threshold: int
     special_member_user_id: str | None
     special_member_display_name: str
+    voice_archive_enabled: bool
+    voice_media_path: Path
+    voice_source_root: Path
+    voice_ffmpeg_path: str
+    napcat_onebot_api_url: str | None
+    napcat_onebot_access_token: str | None
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -63,8 +69,9 @@ def env_int(name: str, default: int) -> int:
 
 def load_settings() -> Settings:
     load_dotenv()
+    database_path = Path(os.getenv("QQ_SUMMARY_DB", BASE_DIR / "data" / "qq_summary.sqlite3"))
     return Settings(
-        database_path=Path(os.getenv("QQ_SUMMARY_DB", BASE_DIR / "data" / "qq_summary.sqlite3")),
+        database_path=database_path,
         deepseek_api_key=os.getenv("DEEPSEEK_API_KEY"),
         deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
@@ -83,4 +90,20 @@ def load_settings() -> Settings:
             "QQ_SUMMARY_SPECIAL_MEMBER_DISPLAY_NAME",
             "魔女公主♪",
         ),
+        voice_archive_enabled=env_bool("QQ_SUMMARY_VOICE_ARCHIVE_ENABLED", True),
+        voice_media_path=Path(
+            os.getenv(
+                "QQ_SUMMARY_VOICE_MEDIA_DIR",
+                database_path.parent / "media" / "voice",
+            )
+        ).expanduser(),
+        voice_source_root=Path(
+            os.getenv(
+                "QQ_SUMMARY_VOICE_SOURCE_ROOT",
+                Path.home() / ".config" / "QQ",
+            )
+        ).expanduser(),
+        voice_ffmpeg_path=os.getenv("QQ_SUMMARY_FFMPEG_PATH", "ffmpeg"),
+        napcat_onebot_api_url=os.getenv("NAPCAT_ONEBOT_API_URL") or None,
+        napcat_onebot_access_token=os.getenv("NAPCAT_ONEBOT_ACCESS_TOKEN") or None,
     )

@@ -5,11 +5,12 @@ import json
 import re
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.onebot import (
     message_display_parts,
     message_to_summary_text,
+    message_voice_segments,
     parse_group_message,
     special_member_relations,
 )
@@ -26,6 +27,7 @@ from app.server import (
     message_payload_from_record,
     parse_manual_summary_limit,
     parse_manual_summary_mode,
+    parse_http_byte_range,
     process_manual_summary_task,
     query_bool,
     revoke_web_session,
@@ -46,6 +48,7 @@ from app.summarizer import (
     render_summary,
     split_messages,
 )
+from app.voice import VoiceArchiveManager
 
 
 EMPTY_SUMMARY_JSON = json.dumps(
@@ -156,6 +159,27 @@ class AppTests(unittest.TestCase):
             }
         ])
 
+    def test_message_display_parts_show_voice_player_metadata(self):
+        raw_message = "hello[CQ:record,file=voice-hash.amr]"
+
+        parts = message_display_parts(raw_message, None)
+        voices = message_voice_segments(raw_message, None)
+
+        self.assertEqual(parts[1]["type"], "audio")
+        self.assertEqual(parts[1]["label"], "语音")
+        self.assertEqual(parts[1]["name"], "voice-hash.amr")
+        self.assertEqual(parts[1]["segment_index"], 1)
+        self.assertEqual(
+            voices,
+            [
+                {
+                    "segment_index": 1,
+                    "source_name": "voice-hash.amr",
+                    "display_name": "voice-hash.amr",
+                }
+            ],
+        )
+
     def test_summary_text_excludes_image_and_face(self):
         raw_message = "before [CQ:image,file=pic.jpg,url=https://example.com/pic.jpg][CQ:face,id=14] after"
 
@@ -223,6 +247,106 @@ class AppTests(unittest.TestCase):
         self.assertTrue(is_allowed_media_url("https://multimedia.nt.qq.com.cn/download?fileid=1"))
         self.assertFalse(is_allowed_media_url("http://127.0.0.1:8000/private.png"))
         self.assertFalse(is_allowed_media_url("http://localhost/private.png"))
+
+    def test_http_byte_range_supports_open_and_suffix_ranges(self):
+        self.assertIsNone(parse_http_byte_range(None, 1000))
+        self.assertEqual(parse_http_byte_range("bytes=100-199", 1000), (100, 199))
+        self.assertEqual(parse_http_byte_range("bytes=900-", 1000), (900, 999))
+        self.assertEqual(parse_http_byte_range("bytes=-100", 1000), (900, 999))
+        with self.assertRaises(ValueError):
+            parse_http_byte_range("bytes=1000-", 1000)
+
+    def test_message_payload_adds_ready_voice_playback_url(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = Store(root / "test.sqlite3")
+            store.init()
+            message = Message("voice-1", "1", "u1", "sender", "[语音]", 1718000001)
+            store.upsert_group("1", "group", message.timestamp)
+            store.save_message(
+                message,
+                {
+                    "raw_message": "[CQ:record,file=voice-hash.amr]",
+                    "message": None,
+                },
+            )
+            media = store.ensure_message_media(
+                "voice-1",
+                "1",
+                0,
+                "voice",
+                "voice-hash.amr",
+                message.timestamp,
+            )
+            playback = root / "voice" / "playback" / "1.mp3"
+            playback.parent.mkdir(parents=True)
+            playback.write_bytes(b"ID3audio")
+            store.complete_message_media(
+                int(media["id"]),
+                original_path=None,
+                playback_path="playback/1.mp3",
+                mime_type="audio/mpeg",
+                size_bytes=playback.stat().st_size,
+                updated_at=message.timestamp,
+            )
+            archiver = VoiceArchiveManager(
+                store,
+                media_root=root / "voice",
+                source_root=root / "source",
+            )
+            record = store.list_recent_message_records("1", limit=1)[0]
+
+            payload = message_payload_from_record(
+                record,
+                store=store,
+                voice_archiver=archiver,
+            )
+
+            part = payload["display_parts"][0]
+            self.assertEqual(part["type"], "audio")
+            self.assertEqual(part["status"], "ready")
+            self.assertEqual(part["playback_url"], f"/api/voice/{media['id']}")
+
+    def test_voice_archiver_copies_amr_and_transcodes_to_mp3(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = Store(root / "test.sqlite3")
+            store.init()
+            timestamp = 1718000001
+            message = Message("voice-2", "1", "u1", "sender", "[语音]", timestamp)
+            store.upsert_group("1", "group", timestamp)
+            store.save_message(message, {})
+            media = store.ensure_message_media(
+                "voice-2",
+                "1",
+                0,
+                "voice",
+                "voice-hash.amr",
+                timestamp,
+            )
+            month = time.strftime("%Y-%m", time.localtime(timestamp))
+            source = root / "qq" / "account" / "nt_data" / "Ptt" / month / "Ori" / "voice-hash.amr"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"#!AMR\nvoice")
+            archiver = VoiceArchiveManager(
+                store,
+                media_root=root / "voice",
+                source_root=root / "qq",
+            )
+
+            def fake_run(command, **_kwargs):
+                Path(command[-1]).write_bytes(b"ID3converted")
+                return Mock(returncode=0, stderr="")
+
+            with (
+                patch("app.voice.shutil.which", return_value="/usr/bin/ffmpeg"),
+                patch("app.voice.subprocess.run", side_effect=fake_run),
+            ):
+                original, playback = archiver._archive_voice(media)
+
+            self.assertIsNotNone(original)
+            self.assertEqual(original.read_bytes(), b"#!AMR\nvoice")
+            self.assertEqual(playback.read_bytes(), b"ID3converted")
 
     def test_webhook_token_matching(self):
         import app.server as server
@@ -836,6 +960,8 @@ class AppTests(unittest.TestCase):
             store.save_message(Message("in-1", "1", "u1", "user", "in 1", 100), {"message_id": "in-1"})
             store.save_message(Message("in-2", "1", "u1", "user", "in 2", 101), {"message_id": "in-2"})
             store.save_message(Message("new", "1", "u1", "user", "new", 200), {"message_id": "new"})
+            store.ensure_message_media("old", "1", 0, "voice", "old.amr", 99)
+            store.ensure_message_media("in-1", "1", 0, "voice", "in.amr", 100)
             store.save_summary(
                 "1",
                 [Message("old", "1", "u1", "user", "old", 99)],
@@ -860,6 +986,8 @@ class AppTests(unittest.TestCase):
             self.assertEqual(range_count, 2)
             self.assertEqual(deleted_count, 2)
             self.assertEqual([row["message_id"] for row in remaining], ["old", "new"])
+            self.assertEqual(len(store.list_message_media("old")), 1)
+            self.assertEqual(store.list_message_media("in-1"), [])
             group = store.get_group("1")
             self.assertEqual(group["message_count"], 2)
             self.assertEqual(group["unread_count"], 1)

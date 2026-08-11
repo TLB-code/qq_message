@@ -11,6 +11,7 @@ The first version is intentionally small: it receives OneBot/NapCat group messag
 - Per-group unread cursor based on the last summarized message.
 - DeepSeek chat-completions summarization.
 - Local web UI for selecting groups, viewing unread messages, and reading summary history.
+- Voice message archiving from NapCat's QQ cache, AMR-to-MP3 conversion, and authenticated browser playback.
 
 ## Requirements
 
@@ -35,12 +36,19 @@ $env:QQ_SUMMARY_AUTO_SUMMARY_ENABLED="true"
 $env:QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD="500"
 $env:QQ_SUMMARY_SPECIAL_MEMBER_USER_ID="重点成员的QQ号"
 $env:QQ_SUMMARY_SPECIAL_MEMBER_DISPLAY_NAME="魔女公主♪"
+$env:QQ_SUMMARY_VOICE_SOURCE_ROOT="C:\Users\your-user\AppData\Roaming\Tencent\QQ"
+$env:QQ_SUMMARY_FFMPEG_PATH="ffmpeg"
 ```
 
 DeepSeek's current OpenAI-compatible base URL is `https://api.deepseek.com`.
 When automatic summaries are enabled globally, you still choose which groups can use it from the web UI. Only selected groups are summarized in 500-message batches as soon as their unread message count reaches the threshold. This runs in the Python service and does not require the web page to be open.
 
 `QQ_SUMMARY_SPECIAL_MEMBER_USER_ID` uses QQ's stable OneBot `user_id` to identify the dedicated member section. Nicknames and group cards are display-only and may change; similar names such as `魔女公主♪（伪）` are not treated as the configured member.
+
+Voice messages are copied from `QQ_SUMMARY_VOICE_SOURCE_ROOT`, converted to MP3 with FFmpeg,
+and served through the authenticated `/api/voice/{id}` endpoint. On a Linux server using root
+NapCat, set the source root to `/root/.config/QQ`. `NAPCAT_ONEBOT_API_URL` is optional and can
+point to a local NapCat OneBot HTTP Server for `get_record` fallback.
 
 ## Run
 

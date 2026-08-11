@@ -5,6 +5,7 @@ import ipaddress
 import json
 import mimetypes
 import queue
+import re
 import secrets
 import threading
 import time
@@ -23,6 +24,7 @@ from .onebot import (
     message_display_parts,
     message_to_summary_text,
     message_to_text,
+    message_voice_segments,
     parse_group_message,
     special_member_relations,
 )
@@ -33,10 +35,20 @@ from .summarizer import (
     SummarizerError,
     SummaryBlock,
 )
+from .voice import VoiceArchiveManager
 
 
 SETTINGS = load_settings()
 STORE = Store(SETTINGS.database_path)
+VOICE_ARCHIVER = VoiceArchiveManager(
+    store=STORE,
+    media_root=SETTINGS.voice_media_path,
+    source_root=SETTINGS.voice_source_root,
+    ffmpeg_path=SETTINGS.voice_ffmpeg_path,
+    napcat_api_url=SETTINGS.napcat_onebot_api_url,
+    napcat_access_token=SETTINGS.napcat_onebot_access_token,
+    enabled=SETTINGS.voice_archive_enabled,
+)
 SUMMARIZER = DeepSeekClient(
     api_key=SETTINGS.deepseek_api_key,
     base_url=SETTINGS.deepseek_base_url,
@@ -102,7 +114,41 @@ def message_from_record(record: dict, content: str | None = None) -> Message:
     )
 
 
-def message_payload_from_record(record: dict) -> dict:
+def register_voice_media(
+    record: dict,
+    event: dict,
+    store: Store | None = None,
+    voice_archiver: VoiceArchiveManager | None = None,
+) -> dict[int, dict]:
+    store = store or STORE
+    existing = {
+        int(media["segment_index"]): media
+        for media in store.list_message_media(str(record["message_id"]))
+    }
+    for voice in message_voice_segments(event.get("raw_message"), event.get("message")):
+        segment_index = int(voice["segment_index"])
+        media = existing.get(segment_index)
+        if media is None:
+            media = store.ensure_message_media(
+                message_id=str(record["message_id"]),
+                group_id=str(record["group_id"]),
+                segment_index=segment_index,
+                media_type="voice",
+                source_name=str(voice.get("source_name") or voice.get("display_name") or ""),
+                created_at=int(record["timestamp"]),
+            )
+            existing[segment_index] = media
+        if voice_archiver is not None and media.get("status") in {"pending", "processing"}:
+            voice_archiver.enqueue(int(media["id"]))
+    return existing
+
+
+def message_payload_from_record(
+    record: dict,
+    store: Store | None = None,
+    voice_archiver: VoiceArchiveManager | None = None,
+) -> dict:
+    store = store or STORE
     event = raw_event_from_record(record)
     message = message_from_record(record)
     payload = {
@@ -119,12 +165,65 @@ def message_payload_from_record(record: dict) -> dict:
         fallback_content=payload["content"],
         reply_lookup=STORE.get_message,
     )
+    voice_media: dict[int, dict] = {}
+    if any(part.get("type") == "audio" for part in display_parts):
+        if voice_archiver is not None and voice_archiver.enabled:
+            voice_media = register_voice_media(
+                record,
+                event,
+                store=store,
+                voice_archiver=voice_archiver,
+            )
+        else:
+            voice_media = {
+                int(media["segment_index"]): media
+                for media in store.list_message_media(str(record["message_id"]))
+            }
     for part in display_parts:
         media_url = part.get("url")
         if isinstance(media_url, str) and is_allowed_media_url(media_url):
             part["proxy_url"] = media_proxy_url(media_url)
+        if part.get("type") != "audio":
+            continue
+        media = voice_media.get(int(part.get("segment_index") or 0))
+        if media is None:
+            part["status"] = "unavailable"
+            continue
+        part["media_id"] = int(media["id"])
+        part["status"] = str(media.get("status") or "pending")
+        part["playback_url"] = f"/api/voice/{media['id']}"
+        part["retry_url"] = f"/api/voice/{media['id']}/retry"
+        if part["status"] == "ready" and voice_archiver is not None:
+            playback_path = voice_archiver.resolve_playback_path(media)
+            if playback_path is None or not playback_path.is_file():
+                store.reset_message_media_for_retry(int(media["id"]), int(time.time()))
+                voice_archiver.enqueue(int(media["id"]))
+                part["status"] = "pending"
     payload["display_parts"] = display_parts
     return payload
+
+
+def parse_http_byte_range(value: str | None, size: int) -> tuple[int, int] | None:
+    if not value:
+        return None
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", value.strip())
+    if not match or size <= 0:
+        raise ValueError("Invalid byte range")
+    start_text, end_text = match.groups()
+    if not start_text and not end_text:
+        raise ValueError("Invalid byte range")
+    if not start_text:
+        suffix_length = int(end_text)
+        if suffix_length <= 0:
+            raise ValueError("Invalid byte range")
+        start = max(size - suffix_length, 0)
+        end = size - 1
+    else:
+        start = int(start_text)
+        end = int(end_text) if end_text else size - 1
+    if start >= size or end < start:
+        raise ValueError("Unsatisfiable byte range")
+    return start, min(end, size - 1)
 
 
 def is_allowed_media_url(value: str) -> bool:
@@ -686,6 +785,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if not self._require_web_auth(parsed.path):
             return
+        if parsed.path.startswith("/api/voice/"):
+            self._handle_voice_get(parsed.path)
+            return
         if parsed.path == "/api/media":
             self._handle_media_get(parse_qs(parsed.query))
             return
@@ -751,6 +853,72 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
+    def _handle_voice_get(self, path: str) -> None:
+        parts = path.strip("/").split("/")
+        if len(parts) != 3 or parts[0:2] != ["api", "voice"]:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+            return
+        try:
+            media_id = int(parts[2])
+        except (TypeError, ValueError):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "Invalid voice media id"})
+            return
+
+        media = STORE.get_message_media(media_id)
+        if not media or media.get("media_type") != "voice":
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Voice media not found"})
+            return
+        if media.get("status") != "ready":
+            VOICE_ARCHIVER.enqueue(media_id)
+            self._json(
+                HTTPStatus.ACCEPTED,
+                {"error": "Voice is still being prepared", "status": media.get("status")},
+            )
+            return
+
+        file_path = VOICE_ARCHIVER.resolve_playback_path(media)
+        if file_path is None or not file_path.is_file():
+            STORE.reset_message_media_for_retry(media_id, int(time.time()))
+            VOICE_ARCHIVER.enqueue(media_id)
+            self._json(HTTPStatus.ACCEPTED, {"error": "Voice file is being restored"})
+            return
+        size = file_path.stat().st_size
+        try:
+            byte_range = parse_http_byte_range(self.headers.get("Range"), size)
+        except ValueError:
+            self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+            return
+
+        if byte_range is None:
+            start, end = 0, size - 1
+            status = HTTPStatus.OK
+        else:
+            start, end = byte_range
+            status = HTTPStatus.PARTIAL_CONTENT
+        length = end - start + 1
+        self.send_response(status)
+        self.send_header("Content-Type", media.get("mime_type") or "audio/mpeg")
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        if byte_range is not None:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Content-Disposition", "inline")
+        self.send_header("Cache-Control", "private, max-age=3600")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        with file_path.open("rb") as file:
+            file.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = file.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/auth/login":
@@ -764,10 +932,34 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if not self._require_web_auth(parsed.path):
             return
+        if parsed.path.startswith("/api/voice/") and parsed.path.endswith("/retry"):
+            self._handle_voice_retry(parsed.path)
+            return
         if parsed.path.startswith("/api/groups/"):
             self._handle_group_post(parsed.path)
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+
+    def _handle_voice_retry(self, path: str) -> None:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4 or parts[0:2] != ["api", "voice"] or parts[3] != "retry":
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+            return
+        try:
+            media_id = int(parts[2])
+        except (TypeError, ValueError):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "Invalid voice media id"})
+            return
+        media = STORE.get_message_media(media_id)
+        if not media or media.get("media_type") != "voice":
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Voice media not found"})
+            return
+        STORE.reset_message_media_for_retry(media_id, int(time.time()))
+        queued = VOICE_ARCHIVER.enqueue(media_id)
+        self._json(
+            HTTPStatus.ACCEPTED,
+            {"ok": True, "queued": queued, "media_id": media_id},
+        )
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
@@ -884,11 +1076,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             {
                 "group": group,
                 "unread": [
-                    message_payload_from_record(record)
+                    message_payload_from_record(record, voice_archiver=VOICE_ARCHIVER)
                     for record in STORE.get_unread_message_records(group_id, limit=limit)
                 ],
                 "recent": [
-                    message_payload_from_record(record)
+                    message_payload_from_record(record, voice_archiver=VOICE_ARCHIVER)
                     for record in STORE.list_recent_message_records(group_id, limit=limit)
                 ],
                 "summaries": STORE.list_summaries(group_id),
@@ -959,7 +1151,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         )
         has_more = len(records) > limit
         records = records[-limit:]
-        messages = [message_payload_from_record(record) for record in records]
+        messages = [
+            message_payload_from_record(record, voice_archiver=VOICE_ARCHIVER)
+            for record in records
+        ]
         next_cursor = None
         if has_more and messages:
             first = messages[0]
@@ -1061,7 +1256,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         )
         has_more = len(records) > limit
         records = records[-limit:]
-        messages = [message_payload_from_record(record) for record in records]
+        messages = [
+            message_payload_from_record(record, voice_archiver=VOICE_ARCHIVER)
+            for record in records
+        ]
         next_cursor = None
         if has_more and messages:
             first = messages[0]
@@ -1107,7 +1305,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
 
+        media_rows = STORE.list_message_media_in_range(group_id, start_timestamp, end_timestamp)
         deleted_count = STORE.delete_message_records_in_range(group_id, start_timestamp, end_timestamp)
+        deleted_media_files = VOICE_ARCHIVER.delete_files(media_rows) if deleted_count else 0
         self._json(
             HTTPStatus.OK,
             {
@@ -1115,6 +1315,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "group": group,
                 "date": selected_date,
                 "deleted_count": deleted_count,
+                "deleted_media_files": deleted_media_files,
             },
         )
 
@@ -1262,6 +1463,16 @@ class RequestHandler(BaseHTTPRequestHandler):
         inserted = STORE.save_message(message, event)
         auto_summary_enqueued = False
         if inserted:
+            if VOICE_ARCHIVER.enabled:
+                register_voice_media(
+                    {
+                        "message_id": message.message_id,
+                        "group_id": message.group_id,
+                        "timestamp": message.timestamp,
+                    },
+                    event,
+                    voice_archiver=VOICE_ARCHIVER,
+                )
             auto_summary_enqueued = enqueue_auto_summary_if_needed(message.group_id)
         self._json(
             HTTPStatus.OK,
@@ -1366,6 +1577,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 def run() -> None:
     STORE.init()
+    recoverable_voice_count = VOICE_ARCHIVER.start()
     resumable_task_ids = STORE.requeue_interrupted_summary_tasks(SUMMARY_PIPELINE_VERSION)
     start_manual_summary_worker()
     for task_id in resumable_task_ids:
@@ -1388,6 +1600,11 @@ def run() -> None:
         "Special member summary: "
         f"{'configured' if SETTINGS.special_member_user_id else 'disabled (missing QQ user_id)'}"
     )
+    print(
+        "Voice archive: "
+        f"{'enabled' if SETTINGS.voice_archive_enabled else 'disabled'} "
+        f"(source {SETTINGS.voice_source_root}, media {SETTINGS.voice_media_path})"
+    )
     print(f"Static frontend: {STATIC_DIR} ({'built' if (STATIC_DIR / 'index.html').is_file() else 'missing build'})")
     if refresh_count:
         print(f"Refreshed {refresh_count} stored CQ messages")
@@ -1395,6 +1612,8 @@ def run() -> None:
         print(f"Queued {auto_summary_count} group(s) for automatic summary")
     if resumable_task_ids:
         print(f"Resumed {len(resumable_task_ids)} manual summary task(s)")
+    if recoverable_voice_count:
+        print(f"Resumed {recoverable_voice_count} voice archive task(s)")
     httpd.serve_forever()
 
 

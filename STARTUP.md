@@ -40,6 +40,13 @@ QQ_SUMMARY_AUTO_SUMMARY_ENABLED=true
 QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD=500
 QQ_SUMMARY_SPECIAL_MEMBER_USER_ID=重点成员的QQ号
 QQ_SUMMARY_SPECIAL_MEMBER_DISPLAY_NAME=魔女公主♪
+
+QQ_SUMMARY_VOICE_ARCHIVE_ENABLED=true
+QQ_SUMMARY_VOICE_MEDIA_DIR=data/media/voice
+QQ_SUMMARY_VOICE_SOURCE_ROOT=/root/.config/QQ
+QQ_SUMMARY_FFMPEG_PATH=ffmpeg
+NAPCAT_ONEBOT_API_URL=
+NAPCAT_ONEBOT_ACCESS_TOKEN=
 ```
 
 不要把真实的 `DEEPSEEK_API_KEY`、`QQ_SUMMARY_WEBHOOK_TOKEN`、`QQ_SUMMARY_WEB_PASSWORD` 提交到 GitHub。
@@ -64,6 +71,12 @@ QQ_SUMMARY_SPECIAL_MEMBER_DISPLAY_NAME=魔女公主♪
 | `QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD` | 否 | `500` | 自动总结阈值。某个已开启自动总结的群，未读历史消息达到这个数量后，后台会自动总结最早的一批消息。 |
 | `QQ_SUMMARY_SPECIAL_MEMBER_USER_ID` | 建议填写 | `重点成员的QQ号` | 专属总结使用的稳定身份。系统按 OneBot `user_id` 判断本人、@ 和回复关系，不按可能变化的昵称判断。 |
 | `QQ_SUMMARY_SPECIAL_MEMBER_DISPLAY_NAME` | 否 | `魔女公主♪` | 专属总结标题中显示的名称，只用于展示，不参与身份判断。 |
+| `QQ_SUMMARY_VOICE_ARCHIVE_ENABLED` | 否 | `true` | 是否归档语音并转换为网页可播放的 MP3。 |
+| `QQ_SUMMARY_VOICE_MEDIA_DIR` | 否 | `data/media/voice` | 项目自己的语音归档目录，保存原始 AMR 和转换后的 MP3。 |
+| `QQ_SUMMARY_VOICE_SOURCE_ROOT` | 建议填写 | `/root/.config/QQ` | QQ 数据根目录。后端会在其 `nt_data/Ptt/.../Ori` 子目录查找 NapCat 收到的 AMR。运行后端的用户必须有读取权限。 |
+| `QQ_SUMMARY_FFMPEG_PATH` | 否 | `ffmpeg` | FFmpeg 命令或绝对路径，用于把 AMR 转成 MP3。 |
+| `NAPCAT_ONEBOT_API_URL` | 否 | `http://127.0.0.1:3000` | NapCat OneBot HTTP Server 地址。配置后优先调用 `get_record`；留空时只读取本地 QQ 语音缓存。不要填写 WebUI 的 `6099` 端口。 |
+| `NAPCAT_ONEBOT_ACCESS_TOKEN` | 否 | `NapCat HTTP Server token` | 调用 NapCat OneBot HTTP API 使用的访问 token；只有启用了 HTTP Server token 时填写。 |
 
 ## 3. 构建前端
 

@@ -236,6 +236,30 @@ def _media_name(data: dict[str, Any]) -> str:
     return ""
 
 
+def _record_source_name(data: dict[str, Any]) -> str:
+    value = data.get("file") or data.get("path") or data.get("url") or ""
+    return str(value).replace("\\", "/").rsplit("/", 1)[-1].strip()
+
+
+def message_voice_segments(raw_message: Any, message: Any) -> list[dict[str, Any]]:
+    voices: list[dict[str, Any]] = []
+    for segment_index, segment in enumerate(_message_to_segments(raw_message, message)):
+        if segment.get("type") != "record":
+            continue
+        data = segment.get("data") or {}
+        if not isinstance(data, dict):
+            data = {}
+        source = _record_source_name(data)
+        voices.append(
+            {
+                "segment_index": segment_index,
+                "source_name": str(source).strip(),
+                "display_name": str(source).strip() or _media_name(data),
+            }
+        )
+    return voices
+
+
 def _compact_display_text(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     compacted: list[dict[str, Any]] = []
     for part in parts:
@@ -253,7 +277,7 @@ def message_display_parts(
     reply_lookup: ReplyLookup | None = None,
 ) -> list[dict[str, Any]]:
     display_parts: list[dict[str, Any]] = []
-    for segment in _message_to_segments(raw_message, message):
+    for segment_index, segment in enumerate(_message_to_segments(raw_message, message)):
         segment_type = segment.get("type")
         data = segment.get("data") or {}
         if not isinstance(data, dict):
@@ -295,7 +319,14 @@ def message_display_parts(
                 }
             )
         elif segment_type == "record":
-            display_parts.append({"type": "attachment", "label": "语音", "name": _media_name(data)})
+            display_parts.append(
+                {
+                    "type": "audio",
+                    "label": "语音",
+                    "name": _record_source_name(data) or _media_name(data),
+                    "segment_index": segment_index,
+                }
+            )
         elif segment_type == "video":
             display_parts.append({"type": "attachment", "label": "视频", "name": _media_name(data)})
         elif segment_type == "file":

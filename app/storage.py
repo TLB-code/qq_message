@@ -66,6 +66,32 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_messages_group_time
                     ON messages(group_id, timestamp, message_id);
 
+                CREATE TABLE IF NOT EXISTS message_media (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT NOT NULL,
+                    group_id TEXT NOT NULL,
+                    segment_index INTEGER NOT NULL,
+                    media_type TEXT NOT NULL,
+                    source_name TEXT NOT NULL,
+                    original_path TEXT,
+                    playback_path TEXT,
+                    mime_type TEXT,
+                    size_bytes INTEGER,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE(message_id, segment_index),
+                    FOREIGN KEY (message_id) REFERENCES messages(message_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_message_media_message
+                    ON message_media(message_id, segment_index);
+
+                CREATE INDEX IF NOT EXISTS idx_message_media_status
+                    ON message_media(status, id);
+
                 CREATE TABLE IF NOT EXISTS summary_cursors (
                     group_id TEXT PRIMARY KEY,
                     last_message_id TEXT,
@@ -391,6 +417,167 @@ class Store:
                 (message_id,),
             ).fetchone()
             return Message(**dict(row)) if row else None
+
+    def ensure_message_media(
+        self,
+        message_id: str,
+        group_id: str,
+        segment_index: int,
+        media_type: str,
+        source_name: str,
+        created_at: int,
+    ) -> dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO message_media (
+                    message_id, group_id, segment_index, media_type, source_name,
+                    status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    message_id,
+                    group_id,
+                    int(segment_index),
+                    media_type,
+                    source_name,
+                    int(created_at),
+                    int(created_at),
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM message_media
+                WHERE message_id = ? AND segment_index = ?
+                """,
+                (message_id, int(segment_index)),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Unable to create message media record")
+            return dict(row)
+
+    def list_message_media(self, message_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM message_media
+                WHERE message_id = ?
+                ORDER BY segment_index ASC
+                """,
+                (message_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_message_media(self, media_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM message_media WHERE id = ?",
+                (int(media_id),),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_recoverable_message_media(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE message_media
+                SET status = 'pending', updated_at = strftime('%s', 'now')
+                WHERE status = 'processing'
+                """
+            )
+            rows = conn.execute(
+                """
+                SELECT * FROM message_media
+                WHERE media_type = 'voice' AND status = 'pending'
+                ORDER BY id ASC
+                """
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def mark_message_media_processing(self, media_id: int, updated_at: int) -> bool:
+        with self.connect() as conn:
+            result = conn.execute(
+                """
+                UPDATE message_media
+                SET status = 'processing', attempts = attempts + 1,
+                    error = NULL, updated_at = ?
+                WHERE id = ? AND status != 'ready'
+                """,
+                (int(updated_at), int(media_id)),
+            )
+            return result.rowcount > 0
+
+    def reset_message_media_for_retry(self, media_id: int, updated_at: int) -> bool:
+        with self.connect() as conn:
+            result = conn.execute(
+                """
+                UPDATE message_media
+                SET status = 'pending', error = NULL, updated_at = ?
+                WHERE id = ? AND status != 'ready'
+                """,
+                (int(updated_at), int(media_id)),
+            )
+            return result.rowcount > 0
+
+    def complete_message_media(
+        self,
+        media_id: int,
+        original_path: str | None,
+        playback_path: str,
+        mime_type: str,
+        size_bytes: int,
+        updated_at: int,
+    ) -> bool:
+        with self.connect() as conn:
+            result = conn.execute(
+                """
+                UPDATE message_media
+                SET original_path = ?, playback_path = ?, mime_type = ?,
+                    size_bytes = ?, status = 'ready', error = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    original_path,
+                    playback_path,
+                    mime_type,
+                    int(size_bytes),
+                    int(updated_at),
+                    int(media_id),
+                ),
+            )
+            return result.rowcount > 0
+
+    def fail_message_media(self, media_id: int, error: str, updated_at: int) -> bool:
+        with self.connect() as conn:
+            result = conn.execute(
+                """
+                UPDATE message_media
+                SET status = 'failed', error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (error[:500], int(updated_at), int(media_id)),
+            )
+            return result.rowcount > 0
+
+    def list_message_media_in_range(
+        self,
+        group_id: str,
+        start_timestamp: int,
+        end_timestamp: int,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT mm.*
+                FROM message_media mm
+                JOIN messages m ON m.message_id = mm.message_id
+                WHERE m.group_id = ? AND m.timestamp >= ? AND m.timestamp < ?
+                ORDER BY mm.id ASC
+                """,
+                (group_id, int(start_timestamp), int(end_timestamp)),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def list_messages_with_raw_cq(self, limit: int = 1000) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -1109,6 +1296,16 @@ class Store:
                         end_timestamp,
                     ),
                 ).fetchone()
+            conn.execute(
+                """
+                DELETE FROM message_media
+                WHERE message_id IN (
+                    SELECT message_id FROM messages
+                    WHERE group_id = ? AND timestamp >= ? AND timestamp < ?
+                )
+                """,
+                (group_id, start_timestamp, end_timestamp),
+            )
             result = conn.execute(
                 """
                 DELETE FROM messages

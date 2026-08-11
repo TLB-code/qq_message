@@ -62,11 +62,12 @@ Linux 用户：当前登录用户
 
 ```text
 /opt/qq_message/data/qq_summary.sqlite3
+/opt/qq_message/data/media/voice（如果已经启用语音归档）
 /opt/qq_message/.env
 NapCat 登录状态和 HTTP Client 配置，或准备在新服务器重新登录并配置
 ```
 
-`qq_summary.sqlite3` 已经包含消息、总结、群配置、手动总结任务、消息快照和分块检查点。不要只克隆 GitHub 仓库，仓库里不包含数据库和 `.env`。
+`qq_summary.sqlite3` 已经包含消息、总结、群配置、手动总结任务、消息快照、分块检查点和语音媒体索引；实际 AMR/MP3 文件保存在 `data/media/voice`。不要只克隆 GitHub 仓库，仓库里不包含数据库、媒体文件和 `.env`。
 
 ### 迁移前准备
 
@@ -115,6 +116,7 @@ mkdir -p migration
 
 cp -a data/qq_summary.sqlite3 migration/qq_summary.sqlite3
 cp -a .env migration/qq-message.env
+if [ -d data/media/voice ]; then tar -C data -czf migration/voice-media.tar.gz media/voice; fi
 chmod 600 migration/qq-message.env
 
 sha256sum migration/qq_summary.sqlite3 migration/qq-message.env
@@ -134,6 +136,14 @@ chmod 600 /opt/qq_message/.env
 chown -R $(whoami):$(whoami) /opt/qq_message/data /opt/qq_message/.env
 sha256sum /opt/qq_message/data/qq_summary.sqlite3 /opt/qq_message/.env
 sqlite3 /opt/qq_message/data/qq_summary.sqlite3 "PRAGMA quick_check;"
+```
+
+如果旧服务器生成了 `voice-media.tar.gz`，在新服务器另外执行：
+
+```bash
+mkdir -p /opt/qq_message/migration /opt/qq_message/data
+scp root@旧服务器IP:/opt/qq_message/migration/voice-media.tar.gz /opt/qq_message/migration/voice-media.tar.gz
+tar -C /opt/qq_message/data -xzf /opt/qq_message/migration/voice-media.tar.gz
 ```
 
 对比新旧服务器的 SHA256，`PRAGMA quick_check` 应输出 `ok`。数据库文件必须完全一致；`.env` 复制后不要把内容发到聊天或日志中。
@@ -212,7 +222,7 @@ sudo journalctl -u qq-message -n 100 --no-pager
 
 ```bash
 sudo apt update
-sudo apt install -y git python3 python3-venv python3-pip nginx curl ca-certificates gnupg sqlite3 rsync dnsutils
+sudo apt install -y git python3 python3-venv python3-pip nginx curl ca-certificates gnupg sqlite3 rsync dnsutils ffmpeg
 
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt install -y nodejs
@@ -290,6 +300,13 @@ QQ_SUMMARY_AUTO_SUMMARY_ENABLED=true
 QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD=500
 QQ_SUMMARY_SPECIAL_MEMBER_USER_ID=重点成员的QQ号
 QQ_SUMMARY_SPECIAL_MEMBER_DISPLAY_NAME=魔女公主♪
+
+QQ_SUMMARY_VOICE_ARCHIVE_ENABLED=true
+QQ_SUMMARY_VOICE_MEDIA_DIR=data/media/voice
+QQ_SUMMARY_VOICE_SOURCE_ROOT=/root/.config/QQ
+QQ_SUMMARY_FFMPEG_PATH=ffmpeg
+NAPCAT_ONEBOT_API_URL=
+NAPCAT_ONEBOT_ACCESS_TOKEN=
 ```
 
 保存后设置权限，避免其他用户直接读取密钥：
@@ -318,6 +335,12 @@ chmod 600 /opt/qq_message/.env
 | `QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD` | 建议 `500` | 自动总结触发阈值。达到阈值后，后台固定每批最多总结 500 条；它不改变手动总结上限。 |
 | `QQ_SUMMARY_SPECIAL_MEMBER_USER_ID` | 建议填写 | 专属总结使用的 QQ `user_id`。昵称或群名片修改后仍可识别，也不会把相似昵称或带“伪”的昵称算作本人。 |
 | `QQ_SUMMARY_SPECIAL_MEMBER_DISPLAY_NAME` | 可选 | 专属总结标题中的显示名称，默认是 `魔女公主♪`，不参与身份判断。 |
+| `QQ_SUMMARY_VOICE_ARCHIVE_ENABLED` | 建议 `true` | 接收语音后归档原文件并转换为网页可播放的 MP3。 |
+| `QQ_SUMMARY_VOICE_MEDIA_DIR` | 默认 `data/media/voice` | 语音归档目录。迁移服务器和备份时要和 SQLite 一起处理。 |
+| `QQ_SUMMARY_VOICE_SOURCE_ROOT` | root 部署填 `/root/.config/QQ` | QQ 数据根目录，后端从 `nt_data/Ptt/.../Ori` 查找 AMR。systemd 的 `User` 必须能读取这个目录。 |
+| `QQ_SUMMARY_FFMPEG_PATH` | 默认 `ffmpeg` | FFmpeg 命令或绝对路径。可以用 `ffmpeg -version` 检查。 |
+| `NAPCAT_ONEBOT_API_URL` | 可选 | NapCat OneBot HTTP Server 地址，例如 `http://127.0.0.1:3000`。留空时使用本地 QQ 缓存；不要填写 WebUI 的 `6099`。 |
+| `NAPCAT_ONEBOT_ACCESS_TOKEN` | 可选 | NapCat OneBot HTTP Server 配置的 access token。 |
 
 ## 5. 构建前端
 
@@ -963,6 +986,62 @@ https://message.tanlb.xyz/webhook/onebot?token=xxx
 
 原因是本机地址更稳定，也不会经过 Cloudflare、Nginx、公网 DNS 或服务器安全组。即使公网域名临时访问异常，只要后端和 NapCat 都在同一台服务器上，NapCat 仍然可以继续把消息推给后端。
 
+#### 8. 配置语音归档和网页播放
+
+先确认 FFmpeg 已安装：
+
+```bash
+ffmpeg -version
+```
+
+确认 NapCat 登录的 QQ 目录中可以找到 AMR：
+
+```bash
+find /root/.config/QQ -type f -path '*/nt_data/Ptt/*/Ori/*.amr' | head
+```
+
+如果能看到类似下面的路径，`.env` 使用 `QQ_SUMMARY_VOICE_SOURCE_ROOT=/root/.config/QQ`：
+
+```text
+/root/.config/QQ/nt_qq_xxx/nt_data/Ptt/2026-08/Ori/xxx.amr
+```
+
+后端收到语音后会复制 AMR 到 `data/media/voice/original`，使用 FFmpeg 转成 MP3 并保存
+到 `data/media/voice/playback`。网页通过需要登录的 `/api/voice/{id}` 接口播放。
+
+如果后端 systemd 使用的不是 `root`，该用户通常不能读取 `/root/.config/QQ`。此时应让
+NapCat 和后端使用同一个 Linux 用户，或者在 NapCat WebUI 中增加 OneBot HTTP Server：
+
+```text
+Host: 127.0.0.1
+Port: 3000
+Token: 自己生成的长 token
+```
+
+然后填写：
+
+```env
+NAPCAT_ONEBOT_API_URL=http://127.0.0.1:3000
+NAPCAT_ONEBOT_ACCESS_TOKEN=与HTTP Server相同的token
+```
+
+这是供后端调用 `get_record` 的 HTTP Server，不是负责上报消息的 HTTP Client，也不是
+NapCat WebUI 的 `6099` 端口。修改 `.env` 后重启：
+
+```bash
+sudo systemctl restart qq-message
+sudo journalctl -u qq-message -n 50 -o cat --no-pager |
+grep -E "Voice archive|QQ Message Summary"
+```
+
+成功处理语音时会看到：
+
+```text
+Voice archive completed: media_id=... message_id=... size_bytes=...
+```
+
+删除网页中某一天的历史消息时，关联的 AMR 和 MP3 也会一起删除。
+
 ### 方案 B：NapCat 在另一台机器
 
 如果 NapCat 在你的 Windows 电脑或另一台服务器上，webhook 地址填写：
@@ -1185,9 +1264,17 @@ ls -lh /opt/qq_message/backups
 
 `PRAGMA quick_check` 应输出 `ok`。建议后续加定时备份，例如每天凌晨备份一次，并定期删除很老的备份。备份文件包含聊天内容、总结和任务检查点，不能放到公开下载目录。
 
+SQLite 只保存语音媒体索引，不包含实际 AMR/MP3。需要保留语音时，另外备份：
+
+```bash
+sudo systemctl stop qq-message
+tar -C /opt/qq_message/data -czf "/opt/qq_message/backups/voice_media_$(date +%F_%H-%M-%S).tar.gz" media/voice
+sudo systemctl start qq-message
+```
+
 ## 15. 数据增长和清理建议
 
-消息、总结、群配置都保存在 SQLite 里。消息越多，`data/qq_summary.sqlite3` 会越大。
+消息、总结、群配置和语音索引保存在 SQLite 里；实际语音保存在 `data/media/voice`。消息和语音越多，这两个位置占用的磁盘都会增长。
 
 建议：
 
