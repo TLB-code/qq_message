@@ -18,6 +18,7 @@ MEDIA_PLACEHOLDER_PATTERN = re.compile(
     r"\[(?:图片|表情|表情包)(?::(?:[^\[\]]|\[[^\[\]]*\])*)?\]"
 )
 MEANINGLESS_SUMMARY_TEXT_PATTERN = re.compile(r"^[\s\[\]()（）【】,，.。!！?？:：;；_\-]+$")
+GROUP_MESSAGE_POST_TYPES = {"message", "message_sent"}
 
 
 def _cq_unescape(value: str) -> str:
@@ -388,7 +389,7 @@ def parse_group_message(
     event: dict[str, Any],
     reply_lookup: ReplyLookup | None = None,
 ) -> Message | None:
-    if event.get("post_type") != "message":
+    if event.get("post_type") not in GROUP_MESSAGE_POST_TYPES:
         return None
     if event.get("message_type") != "group":
         return None
@@ -421,6 +422,17 @@ def parse_group_message(
         content=content,
         timestamp=int(event.get("time") or time.time()),
     )
+
+
+def is_self_message(event: dict[str, Any], configured_user_id: str | None = None) -> bool:
+    user_id = event.get("user_id")
+    if user_id is None:
+        return False
+    user_id_text = str(user_id)
+    self_id = event.get("self_id")
+    if self_id is not None and str(self_id) == user_id_text:
+        return True
+    return bool(configured_user_id and str(configured_user_id) == user_id_text)
 
 
 def group_name_from_event(event: dict[str, Any], group_id: str) -> str:

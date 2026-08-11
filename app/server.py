@@ -21,6 +21,7 @@ from urllib.request import Request, urlopen
 from .config import BASE_DIR, load_settings
 from .onebot import (
     group_name_from_event,
+    is_self_message,
     message_display_parts,
     message_to_summary_text,
     message_to_text,
@@ -156,6 +157,7 @@ def message_payload_from_record(
         "group_id": message.group_id,
         "user_id": message.user_id,
         "sender_name": message.sender_name,
+        "is_self": is_self_message(event, SETTINGS.self_user_id),
         "content": message.content,
         "timestamp": message.timestamp,
     }

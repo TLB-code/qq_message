@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 from app.onebot import (
+    is_self_message,
     message_display_parts,
     message_to_summary_text,
     message_voice_segments,
@@ -76,6 +77,49 @@ class AppTests(unittest.TestCase):
         self.assertEqual(message.group_id, "987654321")
         self.assertEqual(message.sender_name, "群名片")
         self.assertEqual(message.content, "大家好")
+
+    def test_parse_group_message_accepts_self_sent_group_event(self):
+        event = {
+            "post_type": "message_sent",
+            "message_type": "group",
+            "time": 1718000001,
+            "self_id": 3026617255,
+            "message_id": 2004,
+            "group_id": 987654321,
+            "user_id": 3026617255,
+            "raw_message": "这是我发送的消息",
+            "sender": {"nickname": "我的昵称", "card": "我的群名片"},
+        }
+
+        message = parse_group_message(event)
+
+        self.assertIsNotNone(message)
+        self.assertEqual(message.user_id, "3026617255")
+        self.assertEqual(message.sender_name, "我的群名片")
+        self.assertEqual(message.content, "这是我发送的消息")
+        self.assertTrue(is_self_message(event, "3026617255"))
+
+    def test_parse_group_message_rejects_self_sent_private_event(self):
+        event = {
+            "post_type": "message_sent",
+            "message_type": "private",
+            "self_id": 3026617255,
+            "message_id": 2005,
+            "user_id": 3026617255,
+            "raw_message": "私聊消息",
+        }
+
+        self.assertIsNone(parse_group_message(event))
+
+    def test_self_message_detection_uses_configured_user_id_as_fallback(self):
+        event = {
+            "post_type": "message_sent",
+            "message_type": "group",
+            "user_id": 3026617255,
+        }
+
+        self.assertTrue(is_self_message(event, "3026617255"))
+        self.assertFalse(is_self_message(event, "10000"))
 
     def test_parse_group_message_expands_raw_cq_reply(self):
         replied = Message("1358068059", "1", "u1", "origin", "quoted text", 1718000000)
@@ -242,6 +286,31 @@ class AppTests(unittest.TestCase):
 
         self.assertEqual(payload["display_parts"][0]["type"], "image")
         self.assertEqual(payload["display_parts"][0]["proxy_url"], media_proxy_url("https://example.com/pic.jpg"))
+
+    def test_message_payload_marks_self_sent_message(self):
+        record = {
+            "message_id": "self-1",
+            "group_id": "1",
+            "user_id": "3026617255",
+            "sender_name": "我的群名片",
+            "content": "本人消息",
+            "timestamp": 1718000001,
+            "raw_json": json.dumps(
+                {
+                    "post_type": "message_sent",
+                    "message_type": "group",
+                    "self_id": 3026617255,
+                    "user_id": 3026617255,
+                    "raw_message": "本人消息",
+                },
+                ensure_ascii=False,
+            ),
+        }
+
+        payload = message_payload_from_record(record)
+
+        self.assertTrue(payload["is_self"])
+        self.assertEqual(payload["content"], "本人消息")
 
     def test_media_proxy_rejects_local_urls(self):
         self.assertTrue(is_allowed_media_url("https://multimedia.nt.qq.com.cn/download?fileid=1"))

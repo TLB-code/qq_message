@@ -40,6 +40,7 @@ class Settings:
     web_password: str | None
     auto_summary_enabled: bool
     auto_summary_threshold: int
+    self_user_id: str | None
     special_member_user_id: str | None
     special_member_display_name: str
     voice_archive_enabled: bool
@@ -85,6 +86,7 @@ def load_settings() -> Settings:
         web_password=os.getenv("QQ_SUMMARY_WEB_PASSWORD") or None,
         auto_summary_enabled=env_bool("QQ_SUMMARY_AUTO_SUMMARY_ENABLED", True),
         auto_summary_threshold=max(env_int("QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD", 500), 1),
+        self_user_id=os.getenv("QQ_SUMMARY_SELF_USER_ID") or None,
         special_member_user_id=os.getenv("QQ_SUMMARY_SPECIAL_MEMBER_USER_ID") or None,
         special_member_display_name=os.getenv(
             "QQ_SUMMARY_SPECIAL_MEMBER_DISPLAY_NAME",

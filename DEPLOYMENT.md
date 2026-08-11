@@ -295,6 +295,7 @@ QQ_SUMMARY_DB=data/qq_summary.sqlite3
 QQ_SUMMARY_WEBHOOK_DEBUG=false
 QQ_SUMMARY_WEBHOOK_TOKEN=换成一串很长的随机token
 QQ_SUMMARY_WEB_PASSWORD=换成一个网页登录密码
+QQ_SUMMARY_SELF_USER_ID=3026617255
 
 QQ_SUMMARY_AUTO_SUMMARY_ENABLED=true
 QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD=500
@@ -331,6 +332,7 @@ chmod 600 /opt/qq_message/.env
 | `QQ_SUMMARY_WEBHOOK_DEBUG` | 平时 `false` | 是否保存 NapCat 推送的原始事件。调试时可以改成 `true`，但日志会包含聊天内容。 |
 | `QQ_SUMMARY_WEBHOOK_TOKEN` | 强烈建议填写 | NapCat 调用 webhook 的校验 token，防止别人伪造消息推送。 |
 | `QQ_SUMMARY_WEB_PASSWORD` | 强烈建议填写 | 网页登录密码。服务器部署时必须设置，否则网页接口会裸露在公网。 |
+| `QQ_SUMMARY_SELF_USER_ID` | 建议填写 | 运行 NapCat 的 QQ 号，例如 `3026617255`。当事件缺少 `self_id` 时用于识别本人消息。 |
 | `QQ_SUMMARY_AUTO_SUMMARY_ENABLED` | 建议 `true` | 全局自动总结开关。还需要在网页里给具体群开启自动总结。 |
 | `QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD` | 建议 `500` | 自动总结触发阈值。达到阈值后，后台固定每批最多总结 500 条；它不改变手动总结上限。 |
 | `QQ_SUMMARY_SPECIAL_MEMBER_USER_ID` | 建议填写 | 专属总结使用的 QQ `user_id`。昵称或群名片修改后仍可识别，也不会把相似昵称或带“伪”的昵称算作本人。 |

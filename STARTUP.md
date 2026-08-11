@@ -35,6 +35,7 @@ QQ_SUMMARY_DB=data/qq_summary.sqlite3
 QQ_SUMMARY_WEBHOOK_DEBUG=false
 QQ_SUMMARY_WEBHOOK_TOKEN=use-a-long-random-token
 QQ_SUMMARY_WEB_PASSWORD=use-a-strong-page-password
+QQ_SUMMARY_SELF_USER_ID=3026617255
 
 QQ_SUMMARY_AUTO_SUMMARY_ENABLED=true
 QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD=500
@@ -67,6 +68,7 @@ NAPCAT_ONEBOT_ACCESS_TOKEN=
 | `QQ_SUMMARY_WEBHOOK_DEBUG` | 否 | `false` | 是否记录 NapCat 推送过来的原始事件。调试时可以改成 `true`，会写入 `data/webhook_events.log`。日志里可能包含消息内容，平时建议保持 `false`。 |
 | `QQ_SUMMARY_WEBHOOK_TOKEN` | 建议填写 | `一串随机长密码` | NapCat 调用后端 webhook 时使用的校验 token。设置后，NapCat webhook URL 必须带上同样的 `token`，否则后端会拒绝消息。 |
 | `QQ_SUMMARY_WEB_PASSWORD` | 建议填写 | `一个网页登录密码` | 网页访问密码。设置后，打开页面需要先登录；不设置则网页接口不需要登录。部署到服务器时强烈建议设置。 |
+| `QQ_SUMMARY_SELF_USER_ID` | 建议填写 | `3026617255` | 运行 NapCat 的 QQ 号。用于在事件缺少 `self_id` 时识别本人消息；正常情况下优先使用 OneBot 事件中的 `self_id`。 |
 | `QQ_SUMMARY_AUTO_SUMMARY_ENABLED` | 否 | `true` | 是否全局启用后台自动总结功能。开启后，还需要在网页里给具体群聊打开“自动总结”，那个群才会自动总结。 |
 | `QQ_SUMMARY_AUTO_SUMMARY_THRESHOLD` | 否 | `500` | 自动总结阈值。某个已开启自动总结的群，未读历史消息达到这个数量后，后台会自动总结最早的一批消息。 |
 | `QQ_SUMMARY_SPECIAL_MEMBER_USER_ID` | 建议填写 | `重点成员的QQ号` | 专属总结使用的稳定身份。系统按 OneBot `user_id` 判断本人、@ 和回复关系，不按可能变化的昵称判断。 |
